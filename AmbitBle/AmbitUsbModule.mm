@@ -1,0 +1,1470 @@
+//
+//  AmbitUsbModule.mm — iOS data-operations bridge (the ObjC++ twin of Android's
+//  jni_bridge.cpp), registered as NativeModules.AmbitUsbModule to match
+//  src/native/AmbitUsbModule.ts.
+//
+//  On iOS there is no USB — the name is kept only because the JS layer imports
+//  the module by that name and every watch operation is transport-agnostic: it
+//  acts on the shared connected device (ambit_ios_active_device()), which the
+//  BLE handshake in AmbitBleModule produced. So the same getLogs/writeRoutes/
+//  readRegion/settings/sport-mode operations work over BLE with no JS changes,
+//  exactly as they do over USB/JNI on Android.
+//
+//  The portable C++ helpers (base64 via NSData, GPX conversion, the read log
+//  cache) are ported from jni_bridge.cpp; the per-operation bodies call the same
+//  libambit / ambit3_* C functions. USB-only, firmware, and Android file/SAF and
+//  usb-attach methods are stubbed with clear rejections (or benign empties) so
+//  the module loads and the BLE sync path is fully functional.
+//
+#import <React/RCTBridgeModule.h>
+#import <React/RCTEventEmitter.h>
+#import <Foundation/Foundation.h>
+#import <UIKit/UIKit.h>
+#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
+
+#include <string>
+#include <sstream>
+#include <iomanip>
+#include <vector>
+#include <algorithm>
+#include <set>
+#include <cmath>
+#include <climits>
+#include <cstdint>
+#include <ctime>
+#import <os/log.h>
+#import "AmbitBridge.h"
+
+// Trace JS->native calls to stderr (visible via devicectl --console) + unified log.
+#define CORE_LOG(fmt, ...) do { \
+  fprintf(stderr, "[sommet.core] " fmt "\n", ##__VA_ARGS__); \
+  os_log(OS_LOG_DEFAULT, "[sommet.core] " fmt, ##__VA_ARGS__); \
+} while (0)
+
+extern "C" {
+#include "libambit.h"
+#include "libambit_int.h"
+#include "device_driver_ambit3_navigation.h"
+
+// ambit3_* raw ops (defined in device_driver_ambit3.c) — same forward
+// declarations jni_bridge.cpp uses.
+int ambit3_write_route_to_watch(ambit_object_t *object, const ambit3_nav_route_t *routes, size_t route_count);
+int ambit3_add_poi_to_watch(ambit_object_t *object, const char *name, double lat, double lon, int type, int altitude);
+int ambit3_read_flash_region(ambit_object_t *object, uint32_t address, uint32_t length, uint8_t *out_buffer);
+int ambit3_read_poi_list_raw(ambit_object_t *object, uint8_t **out, size_t *out_len);
+int ambit3_set_poi_list(ambit_object_t *object, const uint8_t *expected, size_t expected_len,
+                        const uint8_t *new_list, size_t new_len);
+int ambit3_read_memory_map_raw(ambit_object_t *object, uint8_t **out, size_t *out_len);
+int ambit3_read_object_by_id_raw(ambit_object_t *object, uint8_t entry_id, uint8_t **out, size_t *out_len);
+int ambit3_read_settings_raw(ambit_object_t *object, uint8_t **out, size_t *out_len);
+int ambit3_write_settings_raw(ambit_object_t *object, const uint8_t *data, size_t datalen, uint8_t **out, size_t *out_len);
+int ambit3_read_custom_modes_raw(ambit_object_t *object, uint8_t *out_buffer);
+int ambit3_write_custom_modes_raw(ambit_object_t *object, const uint8_t *data, size_t datalen);
+int ambit3_write_region_raw(ambit_object_t *object, uint32_t base, const uint8_t *data, size_t extent);
+}
+
+// ─── Portable helpers (ported from jni_bridge.cpp) ────────────────────────────
+
+static NSString *b64(const uint8_t *data, size_t len) {
+    if (!data || len == 0) return @"";
+    return [[NSData dataWithBytes:data length:len] base64EncodedStringWithOptions:0];
+}
+
+dispatch_queue_t ambit_ios_device_queue(void) {
+    static dispatch_queue_t queue;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ queue = dispatch_queue_create("com.sommet.ambitcore", DISPATCH_QUEUE_SERIAL); });
+    return queue;
+}
+
+// Over BLE the watch reports its internal CODENAME as the device_info model
+// (e.g. "Emu" for an Ambit3 Peak, "Hoopoe" for a Kailash). Map it to the
+// marketing name — same table as Android's SUUNTO_PID_NAMES, keyed by codename.
+static NSString *friendlyName(NSString *model) {
+    static NSDictionary *map = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        map = @{
+            @"Bluebird": @"Suunto Ambit",       @"Duck":     @"Suunto Ambit2",
+            @"Colibri":  @"Suunto Ambit2 S",    @"Greentit": @"Suunto Ambit2 R",
+            @"Emu":      @"Suunto Ambit3 Peak", @"Finch":    @"Suunto Ambit3 Sport",
+            @"Ibisbill": @"Suunto Ambit3 Run",  @"Kaka":     @"Suunto Ambit3 Vertical",
+            @"Hoopoe":   @"Suunto Kailash",     @"Jabiru":   @"Suunto Traverse",
+            @"Loon":     @"Suunto Traverse Alpha",
+        };
+    });
+    NSString *friendly = map[model];
+    if (friendly) return friendly;
+    return model.length ? model : @"Suunto Ambit";
+}
+
+// Read-log cache: filled by a getLogs() download, indexed the same as the
+// returned GPX array (see jni_bridge.cpp's g_log_cache / g_log_dates).
+static std::vector<std::string> g_log_cache;
+static std::vector<ambit_date_time_t> g_log_dates;
+static std::set<std::string> g_known_dates;
+// Parallel to g_log_cache (same index): each read move's native FIT, base64-encoded (or "" for a
+// move with no usable samples). Consumed by getLogFits. Twin of jni_bridge.cpp's g_log_fit_b64.
+static std::vector<std::string> g_log_fit_b64;
+
+static std::string formatLogId(const ambit_log_header_t *h) {
+    char buf[20];
+    snprintf(buf, sizeof(buf), "%04d%02d%02dT%02d%02d%02d",
+             h->date_time.year, h->date_time.month, h->date_time.day,
+             h->date_time.hour, h->date_time.minute, (int)(h->date_time.msec / 1000));
+    return std::string(buf);
+}
+
+// GPX conversion — a straight port of jni_bridge.cpp's convertEntryToGpx().
+static std::string convertEntryToGpx(const ambit_log_entry_t *entry) {
+    std::ostringstream gpx;
+    char date_buf[32];
+    snprintf(date_buf, sizeof(date_buf), "%04d-%02d-%02dT%02d:%02d:%02dZ",
+             entry->header.date_time.year, entry->header.date_time.month,
+             entry->header.date_time.day, entry->header.date_time.hour,
+             entry->header.date_time.minute, (int)(entry->header.date_time.msec / 1000));
+    const char *act_raw = entry->header.activity_name;
+    bool act_ok = act_raw && act_raw[0] != '\0';
+    uint8_t act_type = entry->header.activity_type;
+
+    gpx << "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+        << "<gpx version=\"1.1\" creator=\"Sommet\""
+        << " xmlns=\"http://www.topografix.com/GPX/1/1\""
+        << " xmlns:gpxtpx=\"http://www.garmin.com/xmlschemas/TrackPointExtension/v1\">\n"
+        << "  <metadata><time>" << date_buf << "</time></metadata>\n";
+    // Shots a Traverse Alpha counted while hunting: one waypoint per shot that has a position,
+    // before the track as GPX wants, and the count in the extensions below. Twin of the
+    // Android writer (jni_bridge.cpp convertEntryToGpx) and of tools/exercise_log.py to_gpx.
+    // Written 2026-11-13 without an iPhone build: not compiled, not seen running.
+    {
+        struct tm shot_tm = {};
+        shot_tm.tm_year = entry->header.date_time.year  - 1900;
+        shot_tm.tm_mon  = entry->header.date_time.month - 1;
+        shot_tm.tm_mday = entry->header.date_time.day;
+        shot_tm.tm_hour = entry->header.date_time.hour;
+        shot_tm.tm_min  = entry->header.date_time.minute;
+        shot_tm.tm_sec  = (int)(entry->header.date_time.msec / 1000);
+        time_t shot_start = mktime(&shot_tm);
+        for (uint32_t i = 0; i < entry->samples_count; i++) {
+            const ambit_log_sample_t &s = entry->samples[i];
+            if (s.type != ambit_log_sample_type_shot || !s.u.shot.has_position) continue;
+            time_t shot_epoch = shot_start + (time_t)(s.time / 1000);
+            char shot_time[32];
+            strftime(shot_time, sizeof(shot_time), "%Y-%m-%dT%H:%M:%SZ", gmtime(&shot_epoch));
+            gpx << std::fixed << std::setprecision(7)
+                << "  <wpt lat=\"" << s.u.shot.latitude / 1e7 << "\" lon=\"" << s.u.shot.longitude / 1e7 << "\">"
+                << "<time>" << shot_time << "</time><sym>Shot</sym><type>shot</type></wpt>\n";
+        }
+        gpx.unsetf(std::ios_base::floatfield);
+        gpx << std::setprecision(6);
+    }
+    gpx << "  <trk><name>" << (act_ok ? act_raw : "") << "</name>\n"
+        << "    <extensions>\n"
+        << "      <duration>" << entry->header.duration / 1000 << "</duration>\n"
+        << "      <distance>" << entry->header.distance << "</distance>\n"
+        << "      <ascent>" << entry->header.ascent << "</ascent>\n"
+        << "      <sport_type>" << (int)act_type << "</sport_type>\n";
+    if (entry->header.has_shots)
+        gpx << "      <shots>" << entry->header.shots << "</shots>\n";
+    gpx << "    </extensions>\n"
+        << "  <trkseg>\n";
+
+    double cur_lat = 0.0, cur_lon = 0.0, cur_ele = 0.0;
+    bool has_pos = false;
+    uint32_t cur_time_ms = 0;
+    struct tm start_tm = {};
+    start_tm.tm_year = entry->header.date_time.year - 1900;
+    start_tm.tm_mon  = entry->header.date_time.month - 1;
+    start_tm.tm_mday = entry->header.date_time.day;
+    start_tm.tm_hour = entry->header.date_time.hour;
+    start_tm.tm_min  = entry->header.date_time.minute;
+    start_tm.tm_sec  = (int)(entry->header.date_time.msec / 1000);
+    time_t start_epoch = mktime(&start_tm);  // matches jni_bridge.cpp (parity with Android GPX times)
+
+    for (uint32_t i = 0; i < entry->samples_count; i++) {
+        const ambit_log_sample_t &s = entry->samples[i];
+        cur_time_ms = s.time;
+        bool emit = false;
+        if (s.type == ambit_log_sample_type_gps_base) {
+            cur_lat = s.u.gps_base.latitude / 1e7;
+            cur_lon = s.u.gps_base.longitude / 1e7;
+            cur_ele = s.u.gps_base.altitude / 100.0;
+            has_pos = true; emit = true;
+        } else if (s.type == ambit_log_sample_type_gps_small) {
+            cur_lat = s.u.gps_small.latitude / 1e7;
+            cur_lon = s.u.gps_small.longitude / 1e7;
+            has_pos = true; emit = true;
+        } else if (s.type == ambit_log_sample_type_gps_tiny) {
+            cur_lat = s.u.gps_tiny.latitude / 1e7;
+            cur_lon = s.u.gps_tiny.longitude / 1e7;
+            has_pos = true; emit = true;
+        } else if (s.type == ambit_log_sample_type_periodic) {
+            // A periodic sample carrying lat+lon IS a position — do NOT require a prior gps_base
+            // (the old `&& has_pos` guard). Trekking (low-rate / FusedTrack GPS) often has no
+            // gps_base and records positions only in periodic samples, so that guard dropped
+            // every one → distance survived but the track was empty ("no GPS data"). 2026-08-30.
+            double lat = cur_lat, lon = cur_lon;
+            bool lat_ok = false, lon_ok = false;
+            for (uint8_t v = 0; v < s.u.periodic.value_count; v++) {
+                const ambit_log_sample_periodic_value_t &pv = s.u.periodic.values[v];
+                if (pv.type == ambit_log_sample_periodic_type_latitude)  { lat = pv.u.latitude / 1e7; lat_ok = true; }
+                if (pv.type == ambit_log_sample_periodic_type_longitude) { lon = pv.u.longitude / 1e7; lon_ok = true; }
+            }
+            if (lat_ok && lon_ok) { cur_lat = lat; cur_lon = lon; has_pos = true; emit = true; }
+        }
+        if (emit && has_pos && (cur_lat != 0.0 || cur_lon != 0.0)) {
+            time_t point_epoch = start_epoch + (time_t)(cur_time_ms / 1000);
+            struct tm *ptm = gmtime(&point_epoch);
+            char time_buf[32];
+            strftime(time_buf, sizeof(time_buf), "%Y-%m-%dT%H:%M:%SZ", ptm);
+            gpx << std::fixed << std::setprecision(7)
+                << "    <trkpt lat=\"" << cur_lat << "\" lon=\"" << cur_lon << "\">"
+                << "<ele>" << std::setprecision(1) << cur_ele << "</ele>"
+                << "<time>" << time_buf << "</time></trkpt>\n";
+        }
+    }
+    gpx << "  </trkseg></trk>\n</gpx>";
+    return gpx.str();
+}
+
+// ─── Conversion log → FIT — twin of jni_bridge.cpp's fitexport (change both together) ────────
+// See the Android copy for the full commentary. Handles outdoor (GPS track + sensor channels)
+// and indoor (sensor channels only) moves alike; units mirror the desktop Python
+// _FIT_SENSOR_FIELDS. Logged-Suunto-App developer fields are intentionally not ported.
+namespace fitexport {
+
+static const uint32_t GARMIN_EPOCH = 631065600u;
+static const uint16_t CRC_TABLE[16] = {
+    0x0000,0xCC01,0xD801,0x1400,0xF001,0x3C00,0x2800,0xE401,
+    0xA001,0x6C00,0x7800,0xB401,0x5000,0x9C01,0x8801,0x4400};
+
+static uint16_t crc16(const uint8_t *data, size_t len) {
+    uint16_t crc = 0;
+    for (size_t i = 0; i < len; i++) {
+        uint16_t tmp = CRC_TABLE[crc & 0x0F];
+        crc = ((crc >> 4) ^ tmp ^ CRC_TABLE[data[i] & 0x0F]) & 0xFFFF;
+        tmp = CRC_TABLE[crc & 0x0F];
+        crc = ((crc >> 4) ^ tmp ^ CRC_TABLE[(data[i] >> 4) & 0x0F]) & 0xFFFF;
+    }
+    return crc;
+}
+
+enum { FE = 0x00, FS8 = 0x01, FU8 = 0x02, FU16 = 0x84, FU32 = 0x86, FS32 = 0x85 };
+
+struct Buf {
+    std::vector<uint8_t> d;
+    void u8(uint32_t v)  { d.push_back((uint8_t)(v & 0xFF)); }
+    void u16(uint32_t v) { u8(v); u8(v >> 8); }
+    void u32(uint32_t v) { u8(v); u8(v >> 8); u8(v >> 16); u8(v >> 24); }
+    void s8(int v)       { if (v < -128) v = -128; if (v > 127) v = 127; u8((uint8_t)(int8_t)v); }
+    struct F { uint8_t num, size, base; };
+    void def(uint8_t local, uint16_t gnum, const std::vector<F> &fields) {
+        u8(0x40 | local); u8(0); u8(0); u16(gnum); u8((uint8_t)fields.size());
+        for (const F &f : fields) { u8(f.num); u8(f.size); u8(f.base); }
+    }
+};
+
+static const long ABSENT = LONG_MIN;
+struct Rec {
+    uint32_t t_g;
+    bool has_pos = false; double lat = 0, lon = 0, ele = 0;
+    uint32_t ms = 0;   // the sample's own time into the move, ms
+    long hr = ABSENT, cad = ABSENT, spd = ABSENT, pwr = ABSENT,
+         dist = ABSENT, alt = ABSENT, temp = ABSENT;
+};
+
+static long chan_val(const Rec &r, int idx) {
+    switch (idx) { case 0: return r.hr; case 1: return r.cad; case 2: return r.dist;
+                   case 3: return r.spd; case 4: return r.pwr; case 5: return r.alt;
+                   default: return r.temp; }
+}
+// FIT session/lap `sport` enum from the watch's activity NAME — twin of jni_bridge.cpp's
+// to_fit_sport() / the desktop _to_fit_sport(). Keep in sync.
+static uint8_t to_fit_sport(const char *name) {
+    if (!name) return 0;
+    std::string t;
+    for (const char *p = name; *p; p++) {
+        char c = *p; if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a'); t += c;
+    }
+    auto has = [&](const char *k) { return t.find(k) != std::string::npos; };
+    if (has("run") || has("course") || has("jogging")) return 1;
+    if (has("cycl") || has("vtt") || has("vélo") || has("velo") || has("bike")) return 2;
+    if (has("alpin")) return 13;
+    if (has("fond") || has("nordic") || has("cross")) return 12;
+    if (has("randon") || has("hik")) return 17;
+    if (has("walk") || has("march")) return 11;
+    return 0;
+}
+
+// Suunto activity id -> FIT sport, filling *sub_sport (fallback when the name is empty). Twin of
+// jni_bridge.cpp's suunto_id_to_fit_sport / the desktop _SUUNTO_ID_TO_FIT. Keep in sync.
+static uint8_t suunto_id_to_fit_sport(uint8_t id, uint8_t *sub_sport) {
+    uint8_t ss = 0, sp = 0;
+    switch (id) {
+        case 3:  sp = 1;  break;
+        case 82: sp = 1;  ss = 3;  break;
+        case 93: sp = 1;  ss = 1;  break;
+        case 84: sp = 11; break;
+        case 4:  sp = 2;  break;
+        case 5:  sp = 2;  ss = 8;  break;
+        case 17: sp = 2;  ss = 58; break;   // Indoor cycling -> Virtual Ride
+        case 6:  sp = 5;  ss = 17; break;
+        case 83: sp = 5;  ss = 18; break;
+        case 11: sp = 17; break;
+        case 12: sp = 11; break;
+        case 85: sp = 11; break;
+        case 20: case 80: sp = 13; break;
+        case 21: sp = 14; break;
+        case 22: case 78: sp = 12; break;
+        case 15: sp = 15; break;
+        case 71: sp = 15; ss = 14; break;
+        case 14: case 72: case 89: sp = 19; break;
+        case 16: case 74: sp = 16; break;
+        case 23: case 87: case 90: sp = 4; ss = 20; break;
+        case 18: case 9: sp = 4; ss = 26; break;
+        case 64: sp = 4; ss = 15; break;
+        case 10: case 79: sp = 4; ss = 21; break;
+        case 95: sp = 4; break;
+        default: sp = 0; break;
+    }
+    if (sub_sport) *sub_sport = ss;
+    return sp;
+}
+
+static void chan_write(Buf &b, int idx, long v) {
+    switch (idx) {
+        case 0: b.u8(v == ABSENT ? 0xFF : (v < 0 ? 0 : (v > 0xFE ? 0xFE : v))); break;
+        case 1: b.u8(v == ABSENT ? 0xFF : (v < 0 ? 0 : (v > 0xFE ? 0xFE : v))); break;
+        case 2: b.u32(v == ABSENT ? 0xFFFFFFFFu : (uint32_t)(v < 0 ? 0 : v * 100)); break;
+        case 3: { if (v == ABSENT) { b.u16(0xFFFF); break; }
+                  long o = v * 10; if (o < 0) o = 0; if (o > 0xFFFE) o = 0xFFFE; b.u16(o); break; }
+        case 4: b.u16(v == ABSENT ? 0xFFFF : (v < 0 ? 0 : (v > 0xFFFE ? 0xFFFE : v))); break;
+        case 5: { if (v == ABSENT) { b.u16(0xFFFF); break; }
+                  long o = (v + 500) * 5; if (o < 0) o = 0; if (o > 0xFFFE) o = 0xFFFE; b.u16(o); break; }
+        default: b.s8(v == ABSENT ? 0x7F : (int)((v < 0 ? v - 5 : v + 5) / 10)); break;
+    }
+}
+
+static std::vector<uint8_t> build(const ambit_log_entry_t *entry) {
+    const ambit_log_header_t &h = entry->header;
+
+    struct tm start_tm = {};
+    start_tm.tm_year = h.date_time.year  - 1900;
+    start_tm.tm_mon  = h.date_time.month - 1;
+    start_tm.tm_mday = h.date_time.day;
+    start_tm.tm_hour = h.date_time.hour;
+    start_tm.tm_min  = h.date_time.minute;
+    start_tm.tm_sec  = (int)(h.date_time.msec / 1000);
+    time_t start_epoch = mktime(&start_tm);
+
+    bool has_gps = false;
+    for (uint32_t i = 0; i < entry->samples_count && !has_gps; i++) {
+        const ambit_log_sample_t &s = entry->samples[i];
+        if (s.type == ambit_log_sample_type_gps_base ||
+            s.type == ambit_log_sample_type_gps_small ||
+            s.type == ambit_log_sample_type_gps_tiny) { has_gps = true; break; }
+        if (s.type == ambit_log_sample_type_periodic) {
+            bool lat_ok = false, lon_ok = false;
+            for (uint8_t v = 0; v < s.u.periodic.value_count; v++) {
+                uint32_t t = s.u.periodic.values[v].type;
+                if (t == ambit_log_sample_periodic_type_latitude)  lat_ok = true;
+                if (t == ambit_log_sample_periodic_type_longitude) lon_ok = true;
+            }
+            if (lat_ok && lon_ok) has_gps = true;
+        }
+    }
+
+    std::vector<Rec> recs;
+    double cur_lat = 0, cur_lon = 0, cur_ele = 0; bool has_pos = false;
+    long cur_hr = ABSENT, cur_cad = ABSENT, cur_spd = ABSENT, cur_pwr = ABSENT,
+         cur_dist = ABSENT, cur_alt = ABSENT, cur_temp = ABSENT;
+    bool saw_pod_cadence = false;
+
+    for (uint32_t i = 0; i < entry->samples_count; i++) {
+        const ambit_log_sample_t &s = entry->samples[i];
+        bool emit = false;
+
+        if (s.type == ambit_log_sample_type_periodic) {
+            double lat = cur_lat, lon = cur_lon; bool lat_ok = false, lon_ok = false;
+            for (uint8_t v = 0; v < s.u.periodic.value_count; v++) {
+                const ambit_log_sample_periodic_value_t &pv = s.u.periodic.values[v];
+                switch (pv.type) {
+                    case ambit_log_sample_periodic_type_latitude:  lat = pv.u.latitude  / 1e7; lat_ok = true; break;
+                    case ambit_log_sample_periodic_type_longitude: lon = pv.u.longitude / 1e7; lon_ok = true; break;
+                    case ambit_log_sample_periodic_type_hr:
+                        if (pv.u.hr != 0xFF) cur_hr = pv.u.hr; break;
+                    case ambit_log_sample_periodic_type_cadence:
+                        if (pv.u.cadence != 0xFF) { cur_cad = pv.u.cadence; saw_pod_cadence = true; } break;
+                    case ambit_log_sample_periodic_type_wristcadence:
+                        if (pv.u.wristcadence != 0xFFFF && !saw_pod_cadence) cur_cad = pv.u.wristcadence; break;
+                    case ambit_log_sample_periodic_type_speed:
+                        if (pv.u.speed != 0xFFFF) cur_spd = pv.u.speed; break;
+                    case ambit_log_sample_periodic_type_bikepower:
+                        if (pv.u.bikepower != 0xFFFF) cur_pwr = pv.u.bikepower; break;
+                    case ambit_log_sample_periodic_type_distance:
+                        cur_dist = pv.u.distance; break;
+                    case ambit_log_sample_periodic_type_altitude:
+                        cur_alt = pv.u.altitude; break;
+                    case ambit_log_sample_periodic_type_temperature:
+                        cur_temp = pv.u.temperature; break;
+                    default: break;
+                }
+            }
+            if (lat_ok && lon_ok) { cur_lat = lat; cur_lon = lon; has_pos = true; }
+            if (has_gps) emit = (lat_ok && lon_ok && (cur_lat != 0.0 || cur_lon != 0.0));
+            else         emit = true;
+        }
+        else if (s.type == ambit_log_sample_type_gps_base) {
+            cur_lat = s.u.gps_base.latitude / 1e7; cur_lon = s.u.gps_base.longitude / 1e7;
+            cur_ele = s.u.gps_base.altitude / 100.0; has_pos = true;
+            emit = (cur_lat != 0.0 || cur_lon != 0.0);
+        }
+        else if (s.type == ambit_log_sample_type_gps_small) {
+            cur_lat = s.u.gps_small.latitude / 1e7; cur_lon = s.u.gps_small.longitude / 1e7;
+            has_pos = true; emit = (cur_lat != 0.0 || cur_lon != 0.0);
+        }
+        else if (s.type == ambit_log_sample_type_gps_tiny) {
+            cur_lat = s.u.gps_tiny.latitude / 1e7; cur_lon = s.u.gps_tiny.longitude / 1e7;
+            has_pos = true; emit = (cur_lat != 0.0 || cur_lon != 0.0);
+        }
+
+        if (emit) {
+            Rec r;
+            r.t_g = (uint32_t)((long)start_epoch + (long)(s.time / 1000) - (long)GARMIN_EPOCH);
+            if (has_gps) { r.has_pos = has_pos; r.lat = cur_lat; r.lon = cur_lon; r.ele = cur_ele; }
+            r.ms = s.time;
+            r.hr = cur_hr; r.cad = cur_cad; r.spd = cur_spd; r.pwr = cur_pwr;
+            r.dist = cur_dist; r.alt = cur_alt; r.temp = cur_temp;
+            recs.push_back(r);
+        }
+    }
+    if (recs.empty()) return {};
+
+    // No live heart rate at all on a move without GPS (a pool swim): take it from the belt's
+    // stored beats. In the water the belt's radio does not reach the watch, so a Smart Sensor
+    // keeps every beat and hands them over at the end as ibi samples; their running sum is the
+    // move's own clock, pauses included (the belt writes a pause as gap records). Twin of the
+    // desktop heart_rate_from_ibi (tools/exercise_log.py): beats of 300-2000 ms count, and the
+    // heart rate at a sample is that of the beats in the 5 s before it.
+    if (!has_gps) {
+        bool live_hr = false;
+        for (const Rec &r : recs) if (r.hr != ABSENT) { live_hr = true; break; }
+        std::vector<double> beat_t; std::vector<uint32_t> beat_v;
+        if (!live_hr) {
+            double t = 0;
+            for (uint32_t i = 0; i < entry->samples_count; i++) {
+                const ambit_log_sample_t &s = entry->samples[i];
+                if (s.type != ambit_log_sample_type_ibi) continue;
+                for (uint8_t k = 0; k < s.u.ibi.ibi_count; k++) {
+                    uint16_t v = s.u.ibi.ibi[k];
+                    t += v;
+                    if (v >= 300 && v <= 2000) { beat_t.push_back(t); beat_v.push_back(v); }
+                }
+            }
+        }
+        if (!beat_t.empty()) {
+            for (Rec &r : recs) {
+                size_t hi = std::upper_bound(beat_t.begin(), beat_t.end(), (double)r.ms) - beat_t.begin();
+                size_t lo = std::lower_bound(beat_t.begin(), beat_t.end(), (double)r.ms - 5000.0) - beat_t.begin();
+                if (hi < lo + 2) continue;
+                double sum = 0;
+                for (size_t k = lo; k < hi; k++) sum += beat_v[k];
+                r.hr = lround(60000.0 * (double)(hi - lo) / sum);
+            }
+        }
+    }
+
+    struct Chan { int idx; uint8_t num, size, base; };
+    static const Chan CH[] = {
+        {0, 3,  1, FU8 }, {1, 4,  1, FU8 }, {2, 5,  4, FU32}, {3, 6,  2, FU16},
+        {4, 7,  2, FU16}, {5, 2,  2, FU16}, {6, 13, 1, FS8 },
+    };
+    const int GPS_ORDER[]    = {0, 1, 3, 4, 6};
+    const int INDOOR_ORDER[] = {0, 1, 2, 3, 4, 5, 6};
+    std::vector<Chan> present;
+    const int *order = has_gps ? GPS_ORDER : INDOOR_ORDER;
+    size_t order_n   = has_gps ? 5 : 7;
+    for (size_t k = 0; k < order_n; k++) {
+        const Chan &c = CH[order[k]];
+        for (const Rec &r : recs) { if (chan_val(r, c.idx) != ABSENT) { present.push_back(c); break; } }
+    }
+
+    uint32_t start_g = recs.front().t_g;
+    uint32_t end_g   = recs.back().t_g;
+    uint32_t dur_ms  = h.duration;
+    uint32_t dist_cm = (uint32_t)((double)h.distance * 100.0);
+    uint8_t  sub_sport = 0;
+    uint8_t  sport   = to_fit_sport(h.activity_name);
+    if (sport == 0) sport = suunto_id_to_fit_sport(h.activity_type, &sub_sport);
+
+    Buf b;
+    b.def(0, 0, {{0,1,FE},{1,2,FU16},{2,2,FU16},{4,4,FU32}});
+    b.u8(0); b.u8(4); b.u16(255); b.u16(0); b.u32(start_g);
+    b.def(1, 34, {{253,4,FU32},{1,2,FU16},{2,1,FE},{3,1,FE},{4,1,FE}});
+    b.u8(1); b.u32(end_g); b.u16(1); b.u8(0); b.u8(26); b.u8(1);
+    // Pool swims: the lengths from the watch's swimming_turn samples (twin of the desktop
+    // extract_pool_lengths). Each turn that raises the running count closes one length and
+    // carries its exact swim time (0.1 s) and strokes; the record is written a few seconds after
+    // the turn, so starts are chained - a length starts where the previous one ended, or at
+    // (record time - swim time) when later, the gap being a rest at the wall.
+    struct Len { double start; double swim; uint16_t strokes; uint8_t style; };
+    std::vector<Len> lens;
+    {
+        uint16_t seen = 0; double prev_end = -1;
+        bool sane = true;
+        // By length count, not by position in the log: the watch can write a length's record
+        // ahead of the one before it (26, 28, 27, 29 on a real swim, 2026-10-04), and walking
+        // them in log order dropped a length.
+        std::vector<const ambit_log_sample_t *> turns;
+        for (uint32_t i = 0; i < entry->samples_count; i++)
+            if (entry->samples[i].type == ambit_log_sample_type_swimming_turn) turns.push_back(&entry->samples[i]);
+        std::stable_sort(turns.begin(), turns.end(), [](const ambit_log_sample_t *a, const ambit_log_sample_t *b) {
+            return a->u.swimming_turn.lengths < b->u.swimming_turn.lengths; });
+        for (const ambit_log_sample_t *turn : turns) {
+            const ambit_log_sample_t &s = *turn;
+            if (s.u.swimming_turn.lengths <= seen || s.u.swimming_turn.duration == 0) continue;
+            seen = s.u.swimming_turn.lengths;
+            double swim = s.u.swimming_turn.duration / 10.0;
+            if (swim > 1800) sane = false;       // not this layout on this model: write none
+            double t  = (double)start_epoch + s.time / 1000.0;
+            double st = t - swim;
+            if (prev_end >= 0 && st < prev_end) st = prev_end;
+            lens.push_back({st, swim, s.u.swimming_turn.strokes, s.u.swimming_turn.style});
+            prev_end = st + swim;
+        }
+        if (!sane) lens.clear();
+    }
+    bool pool = !lens.empty() && h.swimming_pool_length > 0;
+
+    // session (local 2, global 18)
+    std::vector<Buf::F> sfields = {{254,2,FU16},{253,4,FU32},{2,4,FU32},{7,4,FU32},{8,4,FU32},
+                  {9,4,FU32},{22,2,FU16},{23,2,FU16},{5,1,FE},{6,1,FE},{0,1,FE},{1,1,FE}};
+    sfields.push_back({16,1,FU8}); sfields.push_back({17,1,FU8});   // avg / max heart rate, the watch's own
+    if (pool) { sfields.push_back({44,2,FU16}); sfields.push_back({46,1,FE}); sfields.push_back({33,2,FU16}); }
+    b.def(2, 18, sfields);
+    b.u8(2); b.u16(0); b.u32(end_g); b.u32(start_g); b.u32(dur_ms); b.u32(dur_ms);
+    b.u32(dist_cm); b.u16(h.ascent); b.u16(h.descent); b.u8(sport); b.u8(sub_sport); b.u8(8); b.u8(1);
+    b.u8(h.heartrate_avg ? h.heartrate_avg : 0xFF); b.u8(h.heartrate_max ? h.heartrate_max : 0xFF);
+    if (pool) { b.u16(h.swimming_pool_length * 100); b.u8(0); b.u16((uint32_t)lens.size()); }
+    b.def(3, 19, {{254,2,FU16},{253,4,FU32},{2,4,FU32},{7,4,FU32},{9,4,FU32},{0,1,FE},{1,1,FE}});
+    b.u8(3); b.u16(0); b.u32(end_g); b.u32(start_g); b.u32(dur_ms); b.u32(dist_cm); b.u8(9); b.u8(1);
+
+    // length (local 7, global 101), the Garmin way: an ACTIVE length per length swum and an IDLE
+    // length for each rest at the wall between two of them. Ambit style -> FIT swim_stroke
+    // (0 Other has none: invalid).
+    if (!lens.empty()) {
+        b.def(7, 101, {{254,2,FU16},{253,4,FU32},{2,4,FU32},{3,4,FU32},{4,4,FU32},
+                       {5,2,FU16},{0,1,FE},{1,1,FE},{7,1,FE},{12,1,FE}});
+        static const uint8_t STROKE[6] = {0xFF, 3, 1, 2, 0, 4};  // other, fly, back, breast, free, drill
+        uint16_t idx = 0;
+        auto one = [&](double st, double secs, uint32_t strokes, uint8_t stroke, bool active) {
+            uint32_t st_g = (uint32_t)((long)st - (long)GARMIN_EPOCH);
+            b.u8(7); b.u16(idx++);
+            b.u32(st_g + (uint32_t)llround(secs)); b.u32(st_g);
+            b.u32((uint32_t)llround(secs * 1000)); b.u32((uint32_t)llround(secs * 1000));
+            b.u16(strokes); b.u8(28); b.u8(1); b.u8(stroke); b.u8(active ? 1 : 0);
+        };
+        for (size_t k = 0; k < lens.size(); k++) {
+            if (k) {
+                const Len &p = lens[k - 1];
+                double rest = lens[k].start - p.start - p.swim;
+                if (rest >= 1) one(p.start + p.swim, rest, 0xFFFF, 0xFF, false);
+            }
+            const Len &l = lens[k];
+            one(l.start, l.swim, l.strokes, l.style < 6 ? STROKE[l.style] : 0xFF, true);
+        }
+    }
+
+    // Guided-workout steps (twin of the desktop _write_workout_steps): the watch logs an episodic
+    // 0x1e record each time a native workout enters a step - libambit keeps it as an unknown
+    // sample: [type 3][u32 time][0x1e][f32 target min][f32 target max][f32 end value][u16]
+    // [u16 step: 1 interval, 3 rest, 7 workout finished][u16][u16 ends on: 0x0a distance,
+    // 0x0b time, 0x19 lap]. Written as a FIT workout_step (global 27) plus a workout_step start
+    // event (global 21) at the moment it was entered; "finished" becomes a workout stop event.
+    {
+        bool defs = false; uint16_t idx = 0;
+        for (uint32_t i = 0; i < entry->samples_count; i++) {
+            const ambit_log_sample_t &s = entry->samples[i];
+            if (s.type != ambit_log_sample_type_unknown || !s.u.unknown.data || s.u.unknown.datalen < 26) continue;
+            const uint8_t *d = s.u.unknown.data;
+            if (d[0] != 3 || d[5] != 0x1e) continue;
+            float end_value; memcpy(&end_value, d + 14, 4);
+            uint16_t step = (uint16_t)(d[20] | (d[21] << 8)), ends = (uint16_t)(d[24] | (d[25] << 8));
+            uint32_t t_g = (uint32_t)((long)start_epoch + (long)(s.time / 1000) - (long)GARMIN_EPOCH);
+            if (!defs) {
+                b.def(8, 27, {{254,2,FU16},{1,1,FE},{2,4,FU32},{7,1,FE}});
+                b.def(9, 21, {{253,4,FU32},{0,1,FE},{1,1,FE},{3,4,FU32}});
+                defs = true;
+            }
+            if (step == 7) { b.u8(9); b.u32(t_g); b.u8(3); b.u8(1); b.u32(0); continue; }
+            uint8_t dur_type = ends == 0x0a ? 1 : ends == 0x0b ? 0 : ends == 0x19 ? 5 : 0xFF;
+            double scale = ends == 0x0a ? 100.0 : ends == 0x0b ? 1000.0 : 0.0;
+            b.u8(8); b.u16(idx); b.u8(dur_type);
+            b.u32(scale > 0 ? (uint32_t)llround(end_value * scale) : 0xFFFFFFFFu);
+            b.u8(step == 1 ? 0 : step == 3 ? 1 : 0xFF);
+            b.u8(9); b.u32(t_g); b.u8(4); b.u8(0); b.u32(idx);
+            idx++;
+        }
+    }
+
+    std::vector<Buf::F> rfields;
+    rfields.push_back({253,4,FU32});
+    if (has_gps) { rfields.push_back({0,4,FS32}); rfields.push_back({1,4,FS32});
+                   rfields.push_back({2,2,FU16}); rfields.push_back({5,4,FU32}); }
+    for (const Chan &c : present) rfields.push_back({c.num, c.size, c.base});
+    b.def(4, 20, rfields);
+
+    const double SEMI = 2147483648.0 / 180.0;
+    double cum_dist = 0.0;
+    for (size_t i = 0; i < recs.size(); i++) {
+        const Rec &r = recs[i];
+        b.u8(4);
+        b.u32(r.t_g);
+        if (has_gps) {
+            long lat = (long)llround(r.lat * SEMI);
+            long lon = (long)llround(r.lon * SEMI);
+            long alt = (long)llround((r.ele + 500) * 5); if (alt < 0) alt = 0;
+            b.u32((uint32_t)(int32_t)lat);
+            b.u32((uint32_t)(int32_t)lon);
+            b.u16(alt);
+            if (i > 0) {
+                const Rec &q = recs[i - 1];
+                double dy = (r.lat - q.lat) * 111320.0;
+                double dx = (r.lon - q.lon) * 111320.0 * cos(r.lat * M_PI / 180.0);
+                cum_dist += sqrt(dy * dy + dx * dx);
+            }
+            b.u32((uint32_t)llround(cum_dist * 100.0));
+        }
+        for (const Chan &c : present) chan_write(b, c.idx, chan_val(r, c.idx));
+    }
+
+    std::vector<uint8_t> out;
+    out.push_back(14); out.push_back(0x10);
+    out.push_back(0x34); out.push_back(0x08);
+    uint32_t dl = (uint32_t)b.d.size();
+    out.push_back(dl & 0xFF); out.push_back((dl >> 8) & 0xFF);
+    out.push_back((dl >> 16) & 0xFF); out.push_back((dl >> 24) & 0xFF);
+    out.push_back('.'); out.push_back('F'); out.push_back('I'); out.push_back('T');
+    uint16_t hcrc = crc16(out.data(), out.size());
+    out.push_back(hcrc & 0xFF); out.push_back((hcrc >> 8) & 0xFF);
+    out.insert(out.end(), b.d.begin(), b.d.end());
+    uint16_t fcrc = crc16(b.d.data(), b.d.size());
+    out.push_back(fcrc & 0xFF); out.push_back((fcrc >> 8) & 0xFF);
+    return out;
+}
+
+}  // namespace fitexport
+
+static void log_push_callback(void *ud, ambit_log_entry_t *entry) {
+    (void)ud;
+    g_log_cache.push_back(convertEntryToGpx(entry));
+    g_log_dates.push_back(entry->header.date_time);
+    std::vector<uint8_t> fit = fitexport::build(entry);
+    std::string fb = fit.empty() ? std::string()
+        : std::string([b64(fit.data(), fit.size()) UTF8String]);
+    g_log_fit_b64.push_back(fb);
+}
+
+static int log_skip_callback(void *ud, ambit_log_header_t *header) {
+    (void)ud;
+    if (g_known_dates.empty()) return 1;
+    return g_known_dates.count(formatLogId(header)) ? 0 : 1;
+}
+
+// ─── Document import (iOS) ────────────────────────────────────────────────
+// iOS has no SAF; bring a route/track GPX in through UIDocumentPicker instead.
+// asCopy:YES hands us a readable temporary copy — we move it to a stable temp
+// path and resolve that path, so the JS layer reads it with RNFS exactly like
+// Android's pickGpxFile() (route upload + the weather-along-route planner).
+// Cancellation rejects with GPX_PICK_CANCELLED, which NavigationService maps to
+// a silent no-op (matching Android).
+API_AVAILABLE(ios(14.0))
+@interface SommetImportPicker : NSObject <UIDocumentPickerDelegate>
+@property (nonatomic, copy) RCTPromiseResolveBlock resolve;
+@property (nonatomic, copy) RCTPromiseRejectBlock reject;
+@property (nonatomic, copy) NSString *failureCode;
+@property (nonatomic, copy) NSString *cancelCode;
+@end
+
+// Keep the delegate alive while the (non-retaining picker.delegate) sheet is up.
+static SommetImportPicker *gActiveImportPicker;
+
+@implementation SommetImportPicker
+- (void)documentPicker:(UIDocumentPickerViewController *)controller
+didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
+    NSURL *src = urls.firstObject;
+    RCTPromiseResolveBlock res = self.resolve;
+    RCTPromiseRejectBlock rej = self.reject;
+    NSString *failure = self.failureCode;
+    gActiveImportPicker = nil;
+    if (!src) { rej(failure, @"The picker returned no file", nil); return; }
+
+    BOOL scoped = [src startAccessingSecurityScopedResource];
+    NSURL *folder = [NSURL fileURLWithPath:[NSTemporaryDirectory() stringByAppendingPathComponent:NSUUID.UUID.UUIDString] isDirectory:YES];
+    NSURL *dest = [folder URLByAppendingPathComponent:src.lastPathComponent];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSError *err = nil;
+    BOOL ok = [fm createDirectoryAtURL:folder withIntermediateDirectories:YES attributes:nil error:&err]
+        && [fm copyItemAtURL:src toURL:dest error:&err];
+    if (scoped) [src stopAccessingSecurityScopedResource];
+
+    if (!ok) {
+        [fm removeItemAtURL:folder error:NULL];
+        rej(failure, err.localizedDescription ?: @"Could not read the picked file", err);
+        return;
+    }
+    res(dest.path);
+}
+- (void)documentPickerWasCancelled:(UIDocumentPickerViewController *)controller {
+    RCTPromiseRejectBlock rej = self.reject;
+    NSString *cancel = self.cancelCode;
+    gActiveImportPicker = nil;
+    rej(cancel, @"File selection cancelled", nil);
+}
+@end
+
+// ─── Export ("Save as") document picker (iOS) ───────────────────────────────
+// Android's saveFileAs() is SAF's ACTION_CREATE_DOCUMENT; the iOS equivalent is a
+// UIDocumentPickerViewController in EXPORT mode. Same contract as Android: resolve
+// with the chosen destination path, reject SAVE_AS_CANCELLED when the user backs
+// out (JS callers - firmware download, nav backup, the app-data backup - all treat
+// that code as a silent no-op). asCopy:YES so the picker copies our temp file to the
+// chosen location and hands us back a URL we own.
+API_AVAILABLE(ios(14.0))
+@interface SommetExportPicker : NSObject <UIDocumentPickerDelegate>
+@property (nonatomic, copy) RCTPromiseResolveBlock resolve;
+@property (nonatomic, copy) RCTPromiseRejectBlock reject;
+@property (nonatomic, strong) NSURL *stagingFolder;
+@end
+
+static id gActiveExportPicker;
+
+@implementation SommetExportPicker
+- (void)documentPicker:(UIDocumentPickerViewController *)controller
+didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
+    NSURL *dst = urls.firstObject;
+    RCTPromiseResolveBlock res = self.resolve;
+    RCTPromiseRejectBlock rej = self.reject;
+    [NSFileManager.defaultManager removeItemAtURL:self.stagingFolder error:NULL];
+    gActiveExportPicker = nil;
+    if (!dst) { if (rej) rej(@"SAVE_AS_FAILED", @"The picker returned no destination", nil); return; }
+    if (res) res(dst.path ?: dst.absoluteString);
+}
+- (void)documentPickerWasCancelled:(UIDocumentPickerViewController *)controller {
+    RCTPromiseRejectBlock rej = self.reject;
+    [NSFileManager.defaultManager removeItemAtURL:self.stagingFolder error:NULL];
+    gActiveExportPicker = nil;
+    if (rej) rej(@"SAVE_AS_CANCELLED", @"No destination chosen", nil);
+}
+@end
+
+static UIViewController *presentingController(void) {
+    UIViewController *controller = nil;
+    for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+        if (![scene isKindOfClass:[UIWindowScene class]] || scene.activationState != UISceneActivationStateForegroundActive) continue;
+        controller = ((UIWindowScene *)scene).keyWindow.rootViewController;
+        if (controller) break;
+    }
+    if (!controller && UIApplication.sharedApplication.applicationState == UIApplicationStateActive) {
+        controller = UIApplication.sharedApplication.delegate.window.rootViewController;
+    }
+    while (controller.presentedViewController) controller = controller.presentedViewController;
+    return controller;
+}
+
+static void pickFile(NSArray<UTType *> *types, NSString *failure, NSString *cancel,
+                     RCTPromiseResolveBlock resolve, RCTPromiseRejectBlock reject) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIViewController *controller = presentingController();
+        if (!controller || gActiveImportPicker) {
+            reject(failure, @"The document picker is unavailable or already open", nil);
+            return;
+        }
+        UIDocumentPickerViewController *picker = [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:types asCopy:YES];
+        SommetImportPicker *delegate = [SommetImportPicker new];
+        delegate.resolve = resolve;
+        delegate.reject = reject;
+        delegate.failureCode = failure;
+        delegate.cancelCode = cancel;
+        picker.delegate = delegate;
+        gActiveImportPicker = delegate;
+        [controller presentViewController:picker animated:YES completion:nil];
+    });
+}
+
+static NSString *const GPXInboxChanged = @"SommetGPXInboxChanged";
+// Both the inbox and its consumer are accessed on the main queue.
+static NSMutableArray<NSDictionary *> *gSharedGpxFiles;
+
+extern "C" void SommetReceiveGpxURL(NSURL *source) {
+    if (!source.isFileURL || [source.pathExtension caseInsensitiveCompare:@"gpx"] != NSOrderedSame) return;
+    BOOL scoped = [source startAccessingSecurityScopedResource];
+    static dispatch_queue_t queue;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        queue = dispatch_queue_create("com.sommet.gpx-inbox", DISPATCH_QUEUE_SERIAL);
+    });
+    dispatch_async(queue, ^{
+        NSFileManager *files = [NSFileManager defaultManager];
+        NSURL *folder = [[NSURL fileURLWithPath:NSTemporaryDirectory() isDirectory:YES]
+            URLByAppendingPathComponent:NSUUID.UUID.UUIDString isDirectory:YES];
+        NSURL *target = [folder URLByAppendingPathComponent:source.lastPathComponent isDirectory:NO];
+        NSError *folderError = nil;
+        NSError *coordinatorError = nil;
+        __block NSError *copyError = nil;
+        __block BOOL copied = NO;
+        if ([files createDirectoryAtURL:folder withIntermediateDirectories:YES attributes:nil error:&folderError]) {
+            NSFileCoordinator *coordinator = [[NSFileCoordinator alloc] initWithFilePresenter:nil];
+            [coordinator coordinateReadingItemAtURL:source options:NSFileCoordinatorReadingWithoutChanges
+                                               error:&coordinatorError byAccessor:^(NSURL *readURL) {
+                copied = [files copyItemAtURL:readURL toURL:target error:&copyError];
+            }];
+        }
+        if (scoped) [source stopAccessingSecurityScopedResource];
+        NSError *error = folderError ?: coordinatorError ?: copyError;
+        if (!copied) [files removeItemAtURL:folder error:NULL];
+        NSDictionary *item = copied ? @{@"path": target.path}
+            : @{@"error": error.localizedDescription ?: @"Could not read the shared GPX file."};
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (!gSharedGpxFiles) gSharedGpxFiles = [NSMutableArray new];
+            [gSharedGpxFiles addObject:item];
+            [NSNotificationCenter.defaultCenter postNotificationName:GPXInboxChanged object:nil];
+        });
+    });
+}
+
+@interface SommetDocuments : RCTEventEmitter
+@end
+
+@implementation SommetDocuments
+RCT_EXPORT_MODULE(SommetDocuments);
++ (BOOL)requiresMainQueueSetup { return NO; }
+- (dispatch_queue_t)methodQueue { return dispatch_get_main_queue(); }
+- (NSArray<NSString *> *)supportedEvents { return @[@"sharedGpxAvailable"]; }
+- (void)startObserving {
+    [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(gpxInboxChanged:)
+                                               name:GPXInboxChanged object:nil];
+}
+- (void)stopObserving {
+    [NSNotificationCenter.defaultCenter removeObserver:self name:GPXInboxChanged object:nil];
+}
+- (void)gpxInboxChanged:(NSNotification *)notification {
+    [self sendEventWithName:@"sharedGpxAvailable" body:nil];
+}
+RCT_EXPORT_METHOD(takeSharedGpxFiles:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject) {
+    resolve([gSharedGpxFiles copy] ?: @[]);
+    [gSharedGpxFiles removeAllObjects];
+}
+RCT_EXPORT_METHOD(pickGpxFile:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject) {
+    UTType *gpx = [UTType typeWithIdentifier:@"com.topografix.gpx"];
+    pickFile(@[gpx ?: UTTypeData], @"GPX_PICK_FAILED", @"GPX_PICK_CANCELLED", resolve, reject);
+}
+@end
+
+static NSString *fileNameComponent(NSString *name) {
+    NSString *component = name.lastPathComponent;
+    return component.length && ![component isEqualToString:@"."] && ![component isEqualToString:@".."] && ![component isEqualToString:@"/"]
+        ? component : nil;
+}
+
+static void saveDownload(NSString *filePath, NSString *subfolder, NSString *fileName,
+                         RCTPromiseResolveBlock resolve, RCTPromiseRejectBlock reject) {
+    NSString *name = fileNameComponent(fileName);
+    NSString *folderName = fileNameComponent(subfolder);
+    if (!name || (subfolder && !folderName)) {
+        reject(@"DOWNLOAD_FAILED", @"Invalid download name", nil);
+        return;
+    }
+    NSFileManager *files = NSFileManager.defaultManager;
+    NSURL *documents = [files URLsForDirectory:NSDocumentDirectory inDomains:NSUserDomainMask].firstObject;
+    NSURL *folder = [documents URLByAppendingPathComponent:@"Downloads" isDirectory:YES];
+    if (folderName) folder = [folder URLByAppendingPathComponent:folderName isDirectory:YES];
+    NSError *error = nil;
+    if (![files createDirectoryAtURL:folder withIntermediateDirectories:YES attributes:nil error:&error]) {
+        reject(@"DOWNLOAD_FAILED", error.localizedDescription, error);
+        return;
+    }
+    NSURL *source = [NSURL fileURLWithPath:filePath];
+    NSURL *destination = [folder URLByAppendingPathComponent:name isDirectory:NO];
+    for (NSUInteger index = 2; [files fileExistsAtPath:destination.path]; index++) {
+        NSString *label = [NSString stringWithFormat:@"%@ (%lu)", name.stringByDeletingPathExtension, (unsigned long)index];
+        if (name.pathExtension.length) label = [label stringByAppendingPathExtension:name.pathExtension];
+        destination = [folder URLByAppendingPathComponent:label isDirectory:NO];
+    }
+    if (![files copyItemAtURL:source toURL:destination error:&error]) {
+        reject(@"DOWNLOAD_FAILED", error.localizedDescription, error);
+        return;
+    }
+    resolve(nil);
+}
+
+// ─── Module ───────────────────────────────────────────────────────────────────
+
+@interface AmbitUsbModule : RCTEventEmitter <RCTBridgeModule>
+- (void)reportLogProgress:(uint16_t)total current:(uint16_t)current percent:(uint8_t)percent;
+@end
+
+static void log_progress_callback(void *context, uint16_t total, uint16_t current, uint8_t percent) {
+    AmbitUsbModule *module = (__bridge AmbitUsbModule *)context;
+    [module reportLogProgress:total current:current percent:percent];
+}
+
+@implementation AmbitUsbModule {
+    BOOL _hasListeners;
+}
+
+RCT_EXPORT_MODULE(AmbitUsbModule);
+
+// Watch operations block (BLE replies arrive on the CB queue on a different
+// thread); run them on a dedicated serial queue, never main.
+- (dispatch_queue_t)methodQueue { return ambit_ios_device_queue(); }
++ (BOOL)requiresMainQueueSetup { return NO; }
+- (NSArray<NSString *> *)supportedEvents { return @[@"AmbitSyncProgress", @"AmbitUsbAttached", @"AmbitFirmwarePhase"]; }
+- (void)startObserving { _hasListeners = YES; }
+- (void)stopObserving { _hasListeners = NO; }
+
+- (void)reportLogProgress:(uint16_t)total current:(uint16_t)current percent:(uint8_t)percent {
+    if (_hasListeners) {
+        [self sendEventWithName:@"AmbitSyncProgress" body:@{@"total": @(total), @"current": @(current), @"percent": @(percent)}];
+    }
+}
+
+// ── Device info ────────────────────────────────────────────────────────────
+RCT_EXPORT_METHOD(getDeviceInfo:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject) {
+    ambit_object_t *dev = ambit_ios_active_device();
+    CORE_LOG("getDeviceInfo called (dev=%p)", (void*)dev);
+    if (!dev) { reject(@"NOT_CONNECTED", @"Watch not connected", nil); return; }
+
+    const uint8_t *fw = dev->device_info.fw_version;
+    const uint8_t *hw = dev->device_info.hw_version;
+    NSString *fwStr = [NSString stringWithFormat:@"%d.%d.%d", fw[0], fw[1], fw[2] | (fw[3] << 8)];
+    NSString *hwStr = [NSString stringWithFormat:@"%d.%d.%d", hw[0], hw[1], hw[2] | (hw[3] << 8)];
+    NSString *model  = [NSString stringWithUTF8String:dev->device_info.model ?: ""];
+    NSString *serial = [NSString stringWithUTF8String:dev->device_info.serial ?: ""];
+
+    int battery = -1;
+    ambit_device_status_t status;
+    if (libambit_device_status_get(dev, &status) == 0) battery = status.charge;
+
+    resolve(@{ @"name": friendlyName(model),
+               @"model": model, @"serial": serial,
+               @"fwVersion": fwStr, @"hwVersion": hwStr, @"battery": @(battery) });
+}
+
+// ── Activity log sync ──────────────────────────────────────────────────────
+RCT_EXPORT_METHOD(getLogs:(NSArray *)knownIds resolver:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject) {
+    ambit_object_t *dev = ambit_ios_active_device();
+    CORE_LOG("getLogs called (knownIds=%lu dev=%p)", (unsigned long)knownIds.count, (void*)dev);
+    if (!dev) { reject(@"NOT_CONNECTED", @"Watch not connected", nil); return; }
+
+    g_known_dates.clear();
+    for (id v in knownIds) if ([v isKindOfClass:NSString.class]) g_known_dates.insert(std::string([v UTF8String]));
+    g_log_cache.clear();
+    g_log_fit_b64.clear();
+    g_log_dates.clear();
+
+    CORE_LOG("getLogs: calling libambit_log_read ...");
+    int ret = libambit_log_read(dev, log_skip_callback, log_push_callback, log_progress_callback, (__bridge void *)self);
+    CORE_LOG("getLogs: libambit_log_read returned %d, cache=%zu", ret, g_log_cache.size());
+    if (ret < 0) { reject(@"LOG_READ_FAILED", @"Failed to read activity logs", nil); return; }
+
+    NSMutableArray<NSString *> *results = [NSMutableArray arrayWithCapacity:g_log_cache.size()];
+    NSUInteger total = g_log_cache.size();
+    for (NSUInteger i = 0; i < total; i++) {
+        [results addObject:[NSString stringWithUTF8String:g_log_cache[i].c_str()]];
+        if (_hasListeners) [self sendEventWithName:@"AmbitSyncProgress" body:@{@"current": @(i + 1), @"total": @(total)}];
+    }
+    resolve(results);
+}
+
+// Native FIT of each log from the most recent getLogs(), base64-encoded, aligned index-for-index
+// with that GPX array ("" for a move with no FIT). Reads the cache getLogs() filled; does NOT
+// re-read the watch, so call it right after getLogs(). Twin of the Android getLogFits().
+RCT_EXPORT_METHOD(getLogFits:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject) {
+    NSMutableArray<NSString *> *results = [NSMutableArray arrayWithCapacity:g_log_fit_b64.size()];
+    for (size_t i = 0; i < g_log_fit_b64.size(); i++) {
+        [results addObject:[NSString stringWithUTF8String:g_log_fit_b64[i].c_str()]];
+    }
+    resolve(results);
+}
+
+RCT_EXPORT_METHOD(markReadLogsSynced:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject) {
+    ambit_object_t *dev = ambit_ios_active_device();
+    if (!dev) { reject(@"NOT_CONNECTED", @"Watch not connected", nil); return; }
+    int marked = 0;
+    for (size_t i = 0; i < g_log_dates.size(); i++) {
+        ambit_log_entry_t entry; memset(&entry, 0, sizeof(entry));
+        entry.header.date_time = g_log_dates[i];
+        if (libambit_log_synced(dev, &entry) == 0) marked++;
+    }
+    resolve(@(marked));
+}
+
+RCT_EXPORT_METHOD(updateSgee:(NSString *)path resolver:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject) {
+    ambit_object_t *dev = ambit_ios_active_device();
+    if (!dev) { reject(@"NOT_CONNECTED", @"Watch not connected", nil); return; }
+    NSData *data = [NSData dataWithContentsOfFile:path];
+    if (!data) { reject(@"SGEE_FILE_NOT_FOUND", [@"SGEE file not found: " stringByAppendingString:path], nil); return; }
+    int ok = libambit_gps_orbit_write(dev, (uint8_t *)data.bytes, (size_t)data.length);
+    if (ok == 0) resolve(@YES); else reject(@"SGEE_SEND_FAILED", @"Failed to send SGEE data", nil);
+}
+
+RCT_EXPORT_METHOD(setDateTime:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject) {
+    ambit_object_t *dev = ambit_ios_active_device();
+    if (!dev) { reject(@"NOT_CONNECTED", @"Watch not connected", nil); return; }
+    time_t now = time(NULL); struct tm tmv; localtime_r(&now, &tmv);
+    if (libambit_date_time_set(dev, &tmv) == 0) resolve(@YES);
+    else reject(@"TIME_SYNC_FAILED", @"Failed to set watch clock", nil);
+}
+
+RCT_EXPORT_METHOD(syncDisplay:(BOOL)on resolver:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject) {
+    ambit_object_t *dev = ambit_ios_active_device();
+    if (!dev) { reject(@"NOT_CONNECTED", @"Watch not connected", nil); return; }
+    if (on) libambit_sync_display_show(dev);
+    else libambit_sync_display_clear(dev);
+    resolve(@YES);
+}
+
+// ── Navigation: route + POI writes ─────────────────────────────────────────
+// The watch's whole route list in one write: the JS side (RouteMerge.ts) passes the routes
+// already on the watch along with the new one, which is how a send keeps them (routes/05).
+RCT_EXPORT_METHOD(writeRoutes:(NSArray *)routes resolver:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject) {
+    ambit_object_t *dev = ambit_ios_active_device();
+    if (!dev) { reject(@"NOT_CONNECTED", @"Watch not connected", nil); return; }
+    if (routes.count > AMBIT3_MAX_ROUTES) { reject(@"BAD_ROUTE", @"Too many routes", nil); return; }
+
+    // One vector per route, kept alive until the write (the route structs point into them).
+    std::vector<std::vector<ambit3_nav_point_t>> points(routes.count);
+    std::vector<std::vector<ambit3_nav_waypoint_t>> waypoints(routes.count);
+    std::vector<ambit3_nav_route_t> rs(routes.count);
+    // The route index timestamp uses the watch's own non-Unix epoch — same
+    // offset jni_bridge.cpp applies (unix_epoch - route_epoch, precomputed).
+    static const int64_t AMBIT3_ROUTE_EPOCH_OFFSET_SEC = 508055296;
+
+    for (NSUInteger k = 0; k < routes.count; k++) {
+        NSDictionary *route = routes[k];
+        NSArray *pts = route[@"points"];  NSArray *wpts = route[@"waypoints"];
+        if (pts.count < 2 || pts.count > AMBIT3_MAX_ROUTE_POINTS || wpts.count == 0 || wpts.count > AMBIT3_MAX_WAYPOINTS) {
+            reject(@"BAD_ROUTE", @"A route needs 2–1000 track points and at least one waypoint", nil); return;
+        }
+
+        points[k].resize(pts.count);
+        for (NSUInteger i = 0; i < pts.count; i++) {
+            NSDictionary *p = pts[i];
+            points[k][i].latitude  = (int32_t)llround([p[@"lat"] doubleValue] * 1e7);
+            points[k][i].longitude = (int32_t)llround([p[@"lon"] doubleValue] * 1e7);
+            id alt = p[@"alt"];
+            points[k][i].altitude  = (alt == nil || alt == NSNull.null) ? 30000 /* AMBIT3_ALTITUDE_NONE */ : (int)[alt intValue];
+        }
+        waypoints[k].resize(wpts.count);
+        for (NSUInteger i = 0; i < wpts.count; i++) {
+            NSDictionary *w = wpts[i];
+            ambit3_nav_waypoint_t &wp = waypoints[k][i];
+            wp = {};
+            wp.latitude    = (int32_t)llround([w[@"lat"] doubleValue] * 1e7);
+            wp.longitude   = (int32_t)llround([w[@"lon"] doubleValue] * 1e7);
+            wp.point_index = (uint16_t)[w[@"pointIndex"] intValue];
+            strncpy(wp.name, [(w[@"name"] ?: @"") UTF8String], sizeof(wp.name) - 1);
+        }
+
+        long long tsSec = [route[@"timestampSec"] longLongValue];
+        ambit3_nav_route_t &r = rs[k];
+        r = {};
+        strncpy(r.name, [(route[@"name"] ?: @"") UTF8String], sizeof(r.name) - 1);
+        r.points = points[k].data();     r.point_count = (uint16_t)pts.count;
+        r.distance = (uint32_t)[route[@"distanceM"] intValue];
+        r.ascent   = (uint16_t)[route[@"ascentM"] intValue];
+        r.descent  = (uint16_t)[route[@"descentM"] intValue];
+        r.timestamp = (uint32_t)(tsSec + AMBIT3_ROUTE_EPOCH_OFFSET_SEC);
+        r.waypoints = waypoints[k].data(); r.waypoint_count = (uint16_t)wpts.count;
+        time_t t = (time_t)tsSec; struct tm tmv; gmtime_r(&t, &tmv);
+        r.month = (uint8_t)(tmv.tm_mon + 1); r.day = (uint8_t)tmv.tm_mday;
+        r.hour = (uint8_t)tmv.tm_hour; r.minute = (uint8_t)tmv.tm_min; r.second = (uint8_t)tmv.tm_sec;
+    }
+
+    const int status = ambit3_write_route_to_watch(dev, rs.data(), rs.size());
+    switch (status) {
+        case AMBIT3_ROUTE_WRITE_OK:
+            resolve(@YES);
+            break;
+        case AMBIT3_ROUTE_WRITE_INVALID:
+            reject(@"ROUTE_WRITE_INVALID", @"The watch connection or route data is invalid", nil);
+            break;
+        case AMBIT3_ROUTE_WRITE_MAP:
+            reject(@"ROUTE_WRITE_MAP", @"The watch navigation memory layout could not be verified. Nothing was written.", nil);
+            break;
+        case AMBIT3_ROUTE_WRITE_PLAN:
+            reject(@"ROUTE_WRITE_PLAN", @"The navigation data could not be prepared. Nothing was written.", nil);
+            break;
+        case AMBIT3_ROUTE_WRITE_POI_READ:
+            reject(@"ROUTE_WRITE_POI_READ", @"The watch POIs could not be read. Nothing was written.", nil);
+            break;
+        case AMBIT3_ROUTE_WRITE_WAYPOINTS:
+            reject(@"ROUTE_WRITE_WAYPOINTS", @"Bluetooth transfer stopped while sending the route waypoints", nil);
+            break;
+        case AMBIT3_ROUTE_WRITE_ROUTES:
+            reject(@"ROUTE_WRITE_ROUTES", @"Bluetooth transfer stopped while sending the route data", nil);
+            break;
+        case AMBIT3_ROUTE_WRITE_COMMIT:
+            reject(@"ROUTE_WRITE_COMMIT", @"The watch did not confirm applying the new route list. Refresh the watch list to check its state.", nil);
+            break;
+        case AMBIT3_ROUTE_WRITE_POI_RESTORE:
+            reject(@"ROUTE_WRITE_POI_RESTORE", @"The route list was applied, but restoring the watch POIs was interrupted", nil);
+            break;
+        case AMBIT3_ROUTE_WRITE_VERIFY_READ:
+            reject(@"ROUTE_WRITE_VERIFY_READ", @"The watch acknowledged the transfer, but the route list could not be read back. Refresh the watch list to check its state.", nil);
+            break;
+        case AMBIT3_ROUTE_WRITE_VERIFY_CONTENT:
+            reject(@"ROUTE_WRITE_VERIFY_CONTENT", @"The route data read back from the watch did not match the upload", nil);
+            break;
+        default:
+            reject(@"WRITE_ROUTE_FAILED", [NSString stringWithFormat:@"Route transfer failed (status %d)", status], nil);
+            break;
+    }
+}
+
+RCT_EXPORT_METHOD(addPoi:(NSString *)name lat:(double)lat lon:(double)lon type:(NSInteger)type
+                  altitude:(NSInteger)altitude
+                  resolver:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject) {
+    ambit_object_t *dev = ambit_ios_active_device();
+    if (!dev) { reject(@"NOT_CONNECTED", @"Watch not connected", nil); return; }
+    if (ambit3_add_poi_to_watch(dev, [name UTF8String], lat, lon, (int)type, (int)altitude) == 0) resolve(@YES);
+    else reject(@"ADD_POI_FAILED", @"ambit3_add_poi_to_watch failed", nil);
+}
+
+// ── Raw reads (base64) ─────────────────────────────────────────────────────
+RCT_EXPORT_METHOD(readRegion:(double)address length:(double)length
+                  resolver:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject) {
+    ambit_object_t *dev = ambit_ios_active_device();
+    if (!dev) { reject(@"NOT_CONNECTED", @"Watch not connected", nil); return; }
+    if (length <= 0 || length > 2 * 1024 * 1024) { reject(@"BAD_LENGTH", @"implausible length", nil); return; }
+    std::vector<uint8_t> buf((size_t)length);
+    if (ambit3_read_flash_region(dev, (uint32_t)address, (uint32_t)length, buf.data()) != 0) {
+        reject(@"READ_REGION_FAILED", @"ambit3_read_flash_region failed", nil); return;
+    }
+    resolve(b64(buf.data(), buf.size()));
+}
+
+// Shared helper for the malloc'd raw reads (POI list, memory map, history, log, settings).
+- (void)rawRead:(int(^)(ambit_object_t *dev, uint8_t **out, size_t *len))fn
+        resolve:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject code:(NSString *)code {
+    ambit_object_t *dev = ambit_ios_active_device();
+    CORE_LOG("rawRead[%s] called (dev=%p)", code.UTF8String, (void*)dev);
+    if (!dev) { reject(@"NOT_CONNECTED", @"Watch not connected", nil); return; }
+    uint8_t *raw = NULL; size_t rawlen = 0;
+    int rc = fn(dev, &raw, &rawlen);
+    CORE_LOG("rawRead[%s] rc=%d len=%zu", code.UTF8String, rc, rawlen);
+    if (rc != 0) { reject(code, @"raw read failed", nil); return; }
+    NSString *out = (raw && rawlen > 0) ? b64(raw, rawlen) : @"";
+    free(raw);
+    resolve(out);
+}
+
+RCT_EXPORT_METHOD(readPoiListRaw:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject) {
+    [self rawRead:^int(ambit_object_t *d, uint8_t **o, size_t *l){ return ambit3_read_poi_list_raw(d, o, l); }
+          resolve:resolve reject:reject code:@"POI_READ_FAILED"];
+}
+
+RCT_EXPORT_METHOD(setPoiList:(NSString *)expectedB64 newList:(NSString *)newListB64
+                  resolver:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject) {
+    ambit_object_t *dev = ambit_ios_active_device();
+    if (!dev) { reject(@"NOT_CONNECTED", @"Watch not connected", nil); return; }
+    NSData *expected = [[NSData alloc] initWithBase64EncodedString:expectedB64 options:0];
+    NSData *newList = [[NSData alloc] initWithBase64EncodedString:newListB64 options:0];
+    if (!expected || !newList) { reject(@"BAD_BASE64", @"Invalid POI list", nil); return; }
+    int result = ambit3_set_poi_list(dev, (const uint8_t *)expected.bytes, expected.length,
+                                   (const uint8_t *)newList.bytes, newList.length);
+    if (result == -2) reject(@"POI_LIST_CHANGED", @"The POIs on the watch changed since they were read", nil);
+    else if (result < 0) reject(@"POI_SET_FAILED", @"Writing the POI list failed", nil);
+    else resolve(@(result));
+}
+
+RCT_EXPORT_METHOD(readObjectRaw:(NSInteger)entryId resolver:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject) {
+    if (entryId < 0 || entryId > UINT8_MAX) { reject(@"BAD_ENTRY_ID", @"Invalid watch object ID", nil); return; }
+    [self rawRead:^int(ambit_object_t *d, uint8_t **o, size_t *l){ return ambit3_read_object_by_id_raw(d, (uint8_t)entryId, o, l); }
+          resolve:resolve reject:reject code:@"OBJECT_READ_FAILED"];
+}
+RCT_EXPORT_METHOD(readMemoryMapRaw:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject) {
+    [self rawRead:^int(ambit_object_t *d, uint8_t **o, size_t *l){ return ambit3_read_memory_map_raw(d, o, l); }
+          resolve:resolve reject:reject code:@"MEMMAP_READ_FAILED"];
+}
+RCT_EXPORT_METHOD(readDeviceHistoryRaw:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject) {
+    [self rawRead:^int(ambit_object_t *d, uint8_t **o, size_t *l){ return ambit3_read_object_by_id_raw(d, 0x67, o, l); }
+          resolve:resolve reject:reject code:@"HISTORY_READ_FAILED"];
+}
+RCT_EXPORT_METHOD(readDeviceLogRaw:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject) {
+    [self rawRead:^int(ambit_object_t *d, uint8_t **o, size_t *l){ return ambit3_read_object_by_id_raw(d, 0x53, o, l); }
+          resolve:resolve reject:reject code:@"DEVLOG_READ_FAILED"];
+}
+RCT_EXPORT_METHOD(readSettingsRaw:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject) {
+    [self rawRead:^int(ambit_object_t *d, uint8_t **o, size_t *l){ return ambit3_read_settings_raw(d, o, l); }
+          resolve:resolve reject:reject code:@"SETTINGS_READ_FAILED"];
+}
+
+RCT_EXPORT_METHOD(readCustomModesRaw:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject) {
+    ambit_object_t *dev = ambit_ios_active_device();
+    if (!dev) { reject(@"NOT_CONNECTED", @"Watch not connected", nil); return; }
+    std::vector<uint8_t> buf(12288);
+    if (ambit3_read_custom_modes_raw(dev, buf.data()) != 0) { reject(@"CUSTOMMODES_READ_FAILED", @"read failed", nil); return; }
+    resolve(b64(buf.data(), buf.size()));
+}
+
+// ── Raw writes (base64 in) ─────────────────────────────────────────────────
+RCT_EXPORT_METHOD(writeSettingsRaw:(NSString *)dataBase64 resolver:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject) {
+    ambit_object_t *dev = ambit_ios_active_device();
+    if (!dev) { reject(@"NOT_CONNECTED", @"Watch not connected", nil); return; }
+    NSData *data = [[NSData alloc] initWithBase64EncodedString:dataBase64 options:0];
+    if (!data) { reject(@"BAD_BASE64", @"invalid base64", nil); return; }
+    uint8_t *reply = NULL; size_t replylen = 0;
+    int ret = ambit3_write_settings_raw(dev, (const uint8_t *)data.bytes, (size_t)data.length, &reply, &replylen);
+    free(reply);
+    if (ret == 0) resolve(@YES); else reject(@"SETTINGS_WRITE_FAILED", @"write failed", nil);
+}
+
+RCT_EXPORT_METHOD(writeCustomModesRaw:(NSString *)dataBase64 resolver:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject) {
+    ambit_object_t *dev = ambit_ios_active_device();
+    if (!dev) { reject(@"NOT_CONNECTED", @"Watch not connected", nil); return; }
+    NSData *data = [[NSData alloc] initWithBase64EncodedString:dataBase64 options:0];
+    if (!data || data.length != 12288) { reject(@"BAD_CUSTOMMODES", @"expected 12288 bytes", nil); return; }
+    if (ambit3_write_custom_modes_raw(dev, (const uint8_t *)data.bytes, (size_t)data.length) == 0) resolve(@YES);
+    else reject(@"CUSTOMMODES_WRITE_FAILED", @"write failed", nil);
+}
+
+RCT_EXPORT_METHOD(writeRegion:(double)address data:(NSString *)dataBase64 extent:(NSInteger)extent
+                  resolver:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject) {
+    ambit_object_t *dev = ambit_ios_active_device();
+    if (!dev) { reject(@"NOT_CONNECTED", @"Watch not connected", nil); return; }
+    NSData *data = [[NSData alloc] initWithBase64EncodedString:dataBase64 options:0];
+    if (!data) { reject(@"BAD_BASE64", @"invalid base64", nil); return; }
+    if (extent < 4 || (NSUInteger)extent > data.length) { reject(@"BAD_EXTENT", @"bad extent", nil); return; }
+    if (address < 0 || address > 0x00FFFFFF) { reject(@"BAD_ADDRESS", @"implausible address", nil); return; }
+    if (ambit3_write_region_raw(dev, (uint32_t)address, (const uint8_t *)data.bytes, (size_t)extent) == 0) resolve(@YES);
+    else reject(@"WRITE_REGION_FAILED", @"write failed", nil);
+}
+
+// ── connect / disconnect ───────────────────────────────────────────────────
+// iOS has no USB; BLE owns connect/disconnect (AmbitBleModule). These exist so
+// the JS module surface is complete. connect() returns whatever the BLE
+// handshake already learned; disconnect() is a no-op (HomeScreen owns the link).
+RCT_EXPORT_METHOD(connect:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject) {
+    ambit_object_t *dev = ambit_ios_active_device();
+    if (!dev) { reject(@"USB_UNSUPPORTED_IOS", @"No BLE watch connected; USB is not available on iOS", nil); return; }
+    NSString *model = [NSString stringWithUTF8String:dev->device_info.model ?: ""];
+    resolve(@{ @"name": friendlyName(model), @"vendorId": @(0x1493), @"productId": @(0) });
+}
+RCT_EXPORT_METHOD(disconnect:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject) { resolve([NSNull null]); }
+
+// ── Stubs: USB-attach / multi-device (no USB on iOS) ───────────────────────
+RCT_EXPORT_METHOD(wasLaunchedViaUsbAttach:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject) { resolve(@NO); }
+RCT_EXPORT_METHOD(detectAttachedDeviceType:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject) { resolve(@"none"); }
+RCT_EXPORT_METHOD(listDevices:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject) { resolve(@[]); }
+RCT_EXPORT_METHOD(selectDevice:(NSString *)deviceName resolver:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject) { resolve(@YES); }
+
+// ── Stubs: Ambit1/2 USB-only legacy paths (unreachable from iOS) ───────────
+RCT_EXPORT_METHOD(readPersonalSettings:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject) { reject(@"USB_ONLY", @"Ambit 1/2 personal settings are USB-only (not available on iOS)", nil); }
+RCT_EXPORT_METHOD(writePersonalSetting:(NSInteger)offset width:(NSInteger)width value:(NSInteger)value resolver:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject) { reject(@"USB_ONLY", @"Ambit 1/2 personal settings are USB-only (not available on iOS)", nil); }
+RCT_EXPORT_METHOD(readLegacyNav:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject) { reject(@"USB_ONLY", @"Ambit 1/2 legacy nav is USB-only (not available on iOS)", nil); }
+RCT_EXPORT_METHOD(readLegacyRegion:(double)address length:(double)length resolver:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject) { reject(@"USB_ONLY", @"Ambit 1/2 legacy region read is USB-only (not available on iOS)", nil); }
+
+// ── Stubs: firmware flashing (USB path; not ported to iOS) ─────────────────
+RCT_EXPORT_METHOD(firmwarePreflight:(NSString *)path resolver:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject) { reject(@"FIRMWARE_IOS_UNSUPPORTED", @"Firmware flashing is not available on iOS yet", nil); }
+RCT_EXPORT_METHOD(firmwareFlash:(NSString *)path commit:(BOOL)commit confirm:(BOOL)confirm resolver:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject) { reject(@"FIRMWARE_IOS_UNSUPPORTED", @"Firmware flashing is not available on iOS yet", nil); }
+
+// ── Files and sharing ─────────────────────────────────────────────────────
+RCT_EXPORT_METHOD(pickGpxFile:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject) {
+    pickFile(@[UTTypeData], @"GPX_PICK_FAILED", @"GPX_PICK_CANCELLED", resolve, reject);
+}
+RCT_EXPORT_METHOD(shareFile:(NSString *)filePath mimeType:(NSString *)mimeType
+                  resolver:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject) {
+    if (![NSFileManager.defaultManager isReadableFileAtPath:filePath]) {
+        reject(@"SHARE_FAILED", @"The file isn't readable", nil);
+        return;
+    }
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIViewController *controller = presentingController();
+        if (!controller) { reject(@"SHARE_FAILED", @"No foreground window", nil); return; }
+        UIActivityViewController *share = [[UIActivityViewController alloc]
+            initWithActivityItems:@[[NSURL fileURLWithPath:filePath]] applicationActivities:nil];
+        share.popoverPresentationController.sourceView = controller.view;
+        share.popoverPresentationController.sourceRect = CGRectMake(CGRectGetMidX(controller.view.bounds),
+                                                                   CGRectGetMidY(controller.view.bounds), 1, 1);
+        share.completionWithItemsHandler = ^(UIActivityType type, BOOL completed, NSArray *items, NSError *error) {
+            if (error) reject(@"SHARE_FAILED", error.localizedDescription, error);
+            else resolve(nil);
+        };
+        [controller presentViewController:share animated:YES completion:nil];
+    });
+}
+
+RCT_EXPORT_METHOD(saveToDownloads:(NSString *)filePath fileName:(NSString *)fileName mimeType:(NSString *)mimeType
+                  resolver:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject) {
+    saveDownload(filePath, nil, fileName, resolve, reject);
+}
+
+RCT_EXPORT_METHOD(saveToDownloadsIn:(NSString *)filePath subfolder:(NSString *)subfolder fileName:(NSString *)fileName
+                  mimeType:(NSString *)mimeType resolver:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject) {
+    saveDownload(filePath, subfolder, fileName, resolve, reject);
+}
+RCT_EXPORT_METHOD(saveFileAs:(NSString *)sourcePath suggestedName:(NSString *)suggestedName mimeType:(NSString *)mimeType resolver:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject) {
+    if (@available(iOS 14.0, *)) {
+        // The export picker keeps the source file's own name, so stage a copy under the
+        // suggested name in the temp dir and export THAT - otherwise every backup would be
+        // offered as whatever internal temp name the caller happened to use.
+        NSFileManager *fm = [NSFileManager defaultManager];
+        if (![fm fileExistsAtPath:sourcePath]) { reject(@"SAVE_AS_FAILED", @"Source file not found", nil); return; }
+        NSString *name = fileNameComponent(suggestedName.length ? suggestedName : sourcePath);
+        if (!name) { reject(@"SAVE_AS_FAILED", @"Invalid file name", nil); return; }
+        NSURL *folder = [NSURL fileURLWithPath:[NSTemporaryDirectory() stringByAppendingPathComponent:NSUUID.UUID.UUIDString] isDirectory:YES];
+        NSURL *staged = [folder URLByAppendingPathComponent:name];
+        NSError *copyErr = nil;
+        if (![fm createDirectoryAtURL:folder withIntermediateDirectories:YES attributes:nil error:&copyErr]
+            || ![fm copyItemAtURL:[NSURL fileURLWithPath:sourcePath] toURL:staged error:&copyErr]) {
+            [fm removeItemAtURL:folder error:NULL];
+            reject(@"SAVE_AS_FAILED", copyErr.localizedDescription ?: @"Could not stage the file for export", copyErr);
+            return;
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            UIViewController *root = presentingController();
+            if (!root || gActiveExportPicker || gActiveImportPicker) {
+                [fm removeItemAtURL:folder error:NULL];
+                reject(@"SAVE_AS_FAILED", @"The document picker is unavailable or already open", nil);
+                return;
+            }
+            UIDocumentPickerViewController *picker =
+                [[UIDocumentPickerViewController alloc] initForExportingURLs:@[staged] asCopy:YES];
+            SommetExportPicker *delegate = [SommetExportPicker new];
+            delegate.resolve = resolve;
+            delegate.reject = reject;
+            delegate.stagingFolder = folder;
+            picker.delegate = delegate;
+            gActiveExportPicker = delegate;
+
+            [root presentViewController:picker animated:YES completion:nil];
+        });
+    } else {
+        reject(@"SAVE_AS_UNSUPPORTED", @"Saving to a folder needs iOS 14 or newer", nil);
+    }
+}
+
+@end
+
+// ─── Suunto App Zone catalog ───────────────────────────────────────────────
+
+@interface AmbitCatalog : NSObject <RCTBridgeModule>
+@end
+
+@implementation AmbitCatalog
+
+RCT_EXPORT_MODULE(AmbitCatalog);
+
++ (BOOL)requiresMainQueueSetup { return NO; }
+
+static NSURL *catalogDirectory(void) {
+    NSURL *support = [NSFileManager.defaultManager URLsForDirectory:NSApplicationSupportDirectory inDomains:NSUserDomainMask].firstObject;
+    return [support URLByAppendingPathComponent:@"appzone" isDirectory:YES];
+}
+
+static NSDictionary *importCatalog(NSString *path, NSError **error) {
+    NSData *data = [NSData dataWithContentsOfFile:path options:NSDataReadingMappedIfSafe error:error];
+    if (!data) return nil;
+    id catalog = [NSJSONSerialization JSONObjectWithData:data options:0 error:error];
+    if (![catalog isKindOfClass:NSArray.class]) return nil;
+
+    NSMutableArray *entries = [NSMutableArray arrayWithCapacity:[catalog count]];
+    NSMutableData *binary = [NSMutableData data];
+    for (NSDictionary *app in catalog) {
+        if (![app isKindOfClass:NSDictionary.class]) return nil;
+        NSArray *bytes = app[@"binary"] ?: @[];
+        if (![bytes isKindOfClass:NSArray.class]) return nil;
+        NSUInteger offset = binary.length;
+        [binary increaseLengthBy:bytes.count];
+        uint8_t *output = bytes.count ? (uint8_t *)binary.mutableBytes + offset : NULL;
+        for (NSUInteger i = 0; i < bytes.count; i++) {
+            if (![bytes[i] isKindOfClass:NSNumber.class]) return nil;
+            output[i] = (uint8_t)[bytes[i] intValue];
+        }
+        [entries addObject:@{
+            @"ruleId": app[@"ruleId"] ?: @0, @"name": app[@"name"] ?: @"",
+            @"categoryId": app[@"categoryId"] ?: @0, @"activityId": app[@"activityId"] ?: @0,
+            @"description": [app[@"description"] isKindOfClass:NSString.class] ? app[@"description"] : @"",
+            @"compatibleVariants": app[@"compatibleVariants"] ?: @[],
+            @"binaryOffset": @(offset), @"binaryLength": @(bytes.count),
+        }];
+    }
+    NSData *metadata = [NSJSONSerialization dataWithJSONObject:@{@"entries": entries} options:0 error:error];
+    if (!metadata) return nil;
+    NSFileManager *files = NSFileManager.defaultManager;
+    NSURL *destination = catalogDirectory();
+    NSURL *staging = [destination.URLByDeletingLastPathComponent URLByAppendingPathComponent:NSUUID.UUID.UUIDString isDirectory:YES];
+    if (![files createDirectoryAtURL:staging withIntermediateDirectories:YES attributes:nil error:error]) return nil;
+    BOOL ok = [metadata writeToURL:[staging URLByAppendingPathComponent:@"catalog.json"] options:NSDataWritingAtomic error:error]
+        && [binary writeToURL:[staging URLByAppendingPathComponent:@"catalog.bin"] options:NSDataWritingAtomic error:error];
+    if (ok) {
+        if ([files fileExistsAtPath:destination.path]) {
+            ok = [files replaceItemAtURL:destination withItemAtURL:staging backupItemName:nil options:0 resultingItemURL:NULL error:error];
+        } else {
+            ok = [files moveItemAtURL:staging toURL:destination error:error];
+        }
+    }
+    if (!ok) [files removeItemAtURL:staging error:NULL];
+    return ok ? @{@"count": @(entries.count), @"bytes": @(binary.length)} : nil;
+}
+
+RCT_EXPORT_METHOD(hasCatalog:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject) {
+    NSURL *directory = catalogDirectory();
+    NSFileManager *files = NSFileManager.defaultManager;
+    resolve(@([files fileExistsAtPath:[directory URLByAppendingPathComponent:@"catalog.json"].path]
+        && [files fileExistsAtPath:[directory URLByAppendingPathComponent:@"catalog.bin"].path]));
+}
+
+RCT_EXPORT_METHOD(catalogPath:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject) {
+    resolve([catalogDirectory() URLByAppendingPathComponent:@"catalog.json"].path);
+}
+
+RCT_EXPORT_METHOD(binPath:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject) {
+    resolve([catalogDirectory() URLByAppendingPathComponent:@"catalog.bin"].path);
+}
+
+RCT_EXPORT_METHOD(importIndex:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject) {
+    dispatch_queue_t queue = self.methodQueue;
+    pickFile(@[UTTypeData], @"PICK_FAILED", @"CANCELLED", ^(id picked) {
+        NSString *path = picked;
+        dispatch_async(queue, ^{
+            NSError *error = nil;
+            NSDictionary *result = importCatalog(path, &error);
+            [NSFileManager.defaultManager removeItemAtPath:path.stringByDeletingLastPathComponent error:NULL];
+            if (result) resolve(result);
+            else reject(@"IMPORT_FAILED", error.localizedDescription ?: @"Invalid SuuntoLink catalog", error);
+        });
+    }, reject);
+}
+
+RCT_EXPORT_METHOD(pickFile:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject) {
+    dispatch_queue_t queue = self.methodQueue;
+    pickFile(@[UTTypeData], @"PICK_FAILED", @"CANCELLED", ^(id picked) {
+        NSString *path = picked;
+        dispatch_async(queue, ^{
+            NSError *error = nil;
+            NSData *contents = [NSData dataWithContentsOfFile:path options:0 error:&error];
+            [NSFileManager.defaultManager removeItemAtPath:path.stringByDeletingLastPathComponent error:NULL];
+            if (contents) resolve(@{@"base64": [contents base64EncodedStringWithOptions:0], @"name": path.lastPathComponent});
+            else reject(@"PICK_FAILED", error.localizedDescription, error);
+        });
+    }, reject);
+}
+
+RCT_EXPORT_METHOD(copyText:(NSString *)text resolver:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIPasteboard.generalPasteboard.string = text;
+        resolve(@YES);
+    });
+}
+
+- (dispatch_queue_t)methodQueue {
+    static dispatch_queue_t queue;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ queue = dispatch_queue_create("com.sommet.catalog", DISPATCH_QUEUE_SERIAL); });
+    return queue;
+}
+
+@end

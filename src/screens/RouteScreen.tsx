@@ -1,0 +1,771 @@
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useExperimental } from '../config/ExperimentalContext';
+import { View, Text, StyleSheet, Alert, ScrollView, TouchableOpacity, Pressable, Linking, useWindowDimensions, TextInput } from 'react-native';
+import { AdaptiveModal as Modal } from '../components/ui/AdaptiveModal';
+import { useFocusEffect, useRoute, useNavigation } from '@react-navigation/native';
+import type { RouteProp } from '@react-navigation/native';
+import type { RootStackParamList } from '../../App';
+import { useNavigationWatch } from '../navigation/MainTabs';
+import {
+  pickRouteGpx, readRouteGpx, routeForPreview, prepareRouteForWatch, retargetRoutePoints, MAX_ROUTE_POINTS, uploadRoute, readOnWatchNavigation, getCachedNavigation, exportSingleRouteToGpx,
+  PendingRoute, SendRouteState, removeRouteFromWatch,
+} from '../services/NavigationService';
+import {
+  LibraryRoute, listLibrary, saveToLibrary, getLibraryGpx, renameLibraryRoute, deleteLibraryRoute, pointsToGpx,
+} from '../services/RouteLibrary';
+import { syncLibrariesNow, syncLibrariesSoon } from '../services/LibrarySyncRun';
+import { WatchRoute, navigationToGpx } from '../services/RouteReader';
+import { exportRoutesToDownloads } from '../services/ExportAll';
+import { t } from '../i18n';
+import { useV3Theme, v3Spacing, v3Type } from '../theme/v3';
+import { Card } from '../components/ui/Card';
+import { Button, Dropdown, EmptyState, StatusNote } from '../components/ui/primitives';
+import { buildRoutePins } from '../services/RoutePins';
+import { TrackPreview } from '../components/TrackPreview';
+import { RouteMapProfile } from '../components/RouteMapProfile';
+import { RouteSpacingControl } from '../components/RouteSpacingControl';
+import { DEFAULT_ROUTE_SPACING, filterRoutePoints } from '../services/RoutePointFilter';
+import { LockableScrollView } from '../components/ScrollLock';
+import { SortBar } from '../components/ui/SortBar';
+import { getViewMode, setViewMode as persistViewMode, sortItems, sortKeysFor, SortKey, ViewMode } from '../services/ListViewPrefs';
+import { ViewModeToggle } from '../components/ui/ViewModeToggle';
+import { ActionMenu, ActionMenuItem } from '../components/ui/ActionMenu';
+import { detectBryton } from '../services/BrytonUsb';
+import { sendRouteToBryton } from '../services/BrytonTrack';
+import { getKnownMagene, type KnownMagene } from '../services/MageneStore';
+import { sendRoute as sendRouteToMagene } from '../services/MageneRoute';
+import { connectedEdge, sendEdgeCourse } from '../services/Edge500Usb';
+
+type SavedRouteName = Pick<LibraryRoute, 'id' | 'name'>;
+
+type RoutePreview = {
+  key: number;
+  route: PendingRoute;
+  saved?: Promise<SavedRouteName>;
+};
+
+function pendingToGpx(route: PendingRoute): string {
+  return pointsToGpx(route.name, route.points.map(({ lat, lon, alt }) => ({ lat, lon, ele: alt })));
+}
+
+// v3.0 UI port (2026-08-09, "re do routes... to match entirely desktop") - real structural
+// rebuild matching desktop's own RoutesPage.qml: an "Import a route" card with a real
+// preview (name/points/track shape) before you commit to uploading, not one opaque
+// pick-and-immediately-write button, and a real "On the watch" card listing every route
+// already there with its own track preview and a per-route Export - this screen used to be
+// pure action buttons with no browsing at all.
+//
+function formatDist(m: number): string {
+  return m >= 1000 ? `${(m / 1000).toFixed(2)} km` : `${Math.round(m)} m`;
+}
+
+// One Routes screen, like the desktop's since 2026-09-26 (André, 2026-09-29: Android had "Route"
+// and "ROUTES" as two menu items). The import card previews a GPX and sends it to a connected
+// device, or opens it in the planner (RouteWeatherScreen: weather, climbs); the list card shows ONE
+// source from a drop-down - the watch, or the Library of saved routes (every imported or planned
+// route is kept, desktop parity). The planner's "Send to…" comes back here with its route.
+export default function RouteScreen({ active = true }: { active?: boolean } = {}) {
+  return <RouteContent importing={false} active={active} />;
+}
+
+export function RouteImportScreen() {
+  const route = useRoute<RouteProp<RootStackParamList, 'RouteImport'>>();
+  return <RouteContent importing input={route.params} />;
+}
+
+function RouteContent({ importing, active = true, input }: {
+  importing: boolean; active?: boolean; input?: RootStackParamList['RouteImport'];
+}) {
+  const theme = useV3Theme();
+  const styles = createStyles(theme);
+  const navigation = useNavigation<any>();
+
+  // Routes is always in the menu now (André, 2026-09-25): the watch parts show only when Home
+  // says a watch is connected; a GPX can be imported and sent to a Bryton / Magene without one.
+  const params = useNavigationWatch();
+  const watchHere = params.watch;
+  const [preview, setPreview] = useState<RoutePreview | null>(null);
+  const previewKey = useRef(0);
+  const pending = preview?.route ?? null;
+  const [savingName, setSavingName] = useState(false);
+  const [filterEnabled, setFilterEnabled] = useState(false);
+  const [spacing, setSpacing] = useState(DEFAULT_ROUTE_SPACING);
+  const filtered = useMemo(
+    () => pending && filterEnabled ? filterRoutePoints(pending.points, spacing) : null,
+    [pending, filterEnabled, spacing],
+  );
+
+  function showPending(route: PendingRoute, saved?: Promise<SavedRouteName>) {
+    const key = ++previewKey.current;
+    setFilterEnabled(false);
+    setSpacing(DEFAULT_ROUTE_SPACING);
+    setPreview({ key, route, saved });
+    saved?.then(({ name }) => updatePreviewName(key, name)).catch(() => {});
+  }
+
+  function updatePreviewName(key: number, name: string) {
+    setPreview(current => current?.key === key && current.route.name !== name
+      ? { ...current, route: { ...current.route, name } } : current);
+  }
+
+  function editPreviewName() {
+    if (!preview) return;
+    const target = preview;
+    Alert.prompt(t.routeRename, undefined, [
+      { text: t.cancel, style: 'cancel' },
+      { text: t.saveBtn, onPress: async (value?: string) => {
+        const name = value?.trim();
+        if (!name) {
+          Alert.alert(t.routeRename, t.routeNameRequired);
+          return;
+        }
+        if (name === target.route.name) return;
+
+        setSavingName(true);
+        try {
+          const saved = await target.saved;
+          if (saved) {
+            await renameLibraryRoute(saved.id, name);
+            syncLibrariesSoon();
+          }
+          updatePreviewName(target.key, name);
+        } catch (error) {
+          Alert.alert(t.error, error instanceof Error ? error.message : t.unknownError);
+        } finally {
+          setSavingName(false);
+        }
+      } },
+    ], 'plain-text', target.route.name);
+  }
+
+  function prepareUpload(route: PendingRoute) {
+    if (!params.pins) return prepareRouteForWatch(route);
+    // Snap direction pins to the chosen path without adding points to its geometry.
+    try {
+      const result = buildRoutePins(pendingToGpx(route), { target: 'ambit', name: route.name });
+      const directions = result.pins.filter(pin => pin.kind !== 'start' && pin.kind !== 'end')
+        .map(pin => ({ name: pin.name, lat: pin.lat, lon: pin.lon, pointIndex: 0 }));
+      const located = retargetRoutePoints({ ...route, waypoints: directions }, route.points);
+      const occupied = new Set(route.waypoints.map(waypoint => waypoint.pointIndex));
+      const waypoints = [...route.waypoints];
+      for (const waypoint of located.waypoints) {
+        if (occupied.has(waypoint.pointIndex)) continue;
+        occupied.add(waypoint.pointIndex);
+        const point = route.points[waypoint.pointIndex];
+        waypoints.push({ ...waypoint, lat: point.lat, lon: point.lon });
+      }
+      if (waypoints.length <= 100) {
+        waypoints.sort((a, b) => a.pointIndex - b.pointIndex);
+        return prepareRouteForWatch({ ...route, waypoints });
+      }
+    } catch {
+      // A route that exceeds the direction-pin budget can still be sent with its own waypoints.
+    }
+    return prepareRouteForWatch(route);
+  }
+  const scrollRef = useRef<ScrollView>(null);
+
+  // ---- Library + planner (desktop parity) ----------------------------------------------------
+  const [library, setLibrary] = useState<LibraryRoute[]>([]);
+  const refreshLibrary = useCallback(() => { listLibrary().then(setLibrary).catch(() => {}); }, []);
+  useFocusEffect(useCallback(() => { if (active && !importing) refreshLibrary(); }, [active, importing, refreshLibrary]));
+  // The library is shared between devices through Sommet Sync (LibrarySync.ts): fetch what the
+  // others saved when the screen opens, and send a change made here a few seconds after it.
+  useFocusEffect(useCallback(() => {
+    if (!active || importing) return;
+    syncLibrariesNow().then(changed => { if (changed) refreshLibrary(); }).catch(() => {});
+  }, [active, importing, refreshLibrary]));
+  // The list card's source: the watch when one is here, else the Library (always there).
+  const [source, setSource] = useState<number>(watchHere ? 0 : 1);   // 0 = on the watch, 1 = Library
+  useEffect(() => { if (!watchHere) setSource(1); }, [watchHere]);
+  const [renaming, setRenaming] = useState<{ id: string; value: string } | null>(null);
+
+  function openInPlanner(name: string, points: { lat: number; lon: number; ele?: number | null }[]) {
+    navigation.navigate('RouteWeather', { route: points.map(p => ({ lat: p.lat, lon: p.lon, ele: p.ele ?? null })), name });
+  }
+  async function libraryRoute(r: LibraryRoute): Promise<PendingRoute | null> {
+    try { return routeForPreview(await getLibraryGpx(r.id), r.name); }
+    catch (e: any) { Alert.alert(t.error, e?.message ?? t.unknownError); return null; }
+  }
+  // What a library route can do, for its line in the list and for its square card's ⋯.
+  async function libOpen(r: LibraryRoute) {
+    const pr = await libraryRoute(r);
+    if (pr) openInPlanner(r.name, pr.points.map(p => ({ lat: p.lat, lon: p.lon, ele: p.alt })));
+  }
+  function libSend(r: LibraryRoute) {
+    navigation.navigate('RouteImport', { libraryRoute: { id: r.id, name: r.name } });
+  }
+  function libDelete(r: LibraryRoute) {
+    Alert.alert('Delete route', `Remove “${r.name}” from the Library?`, [
+      { text: t.cancel, style: 'cancel' },
+      { text: t.delete, style: 'destructive', onPress: () => deleteLibraryRoute(r.id).then(() => { refreshLibrary(); syncLibrariesSoon(refreshLibrary); }) },
+    ]);
+  }
+  // The picker, external documents, the library and the planner all use the same preview.
+  useEffect(() => {
+    if (!importing || !input) return;
+    let active = true;
+    async function load() {
+      if (input?.incoming) {
+        if ('error' in input.incoming) throw new Error(input.incoming.error);
+        const picked = await readRouteGpx(input.incoming.path);
+        if (active) importPicked(picked);
+      } else if (input?.libraryRoute) {
+        const { id, name } = input.libraryRoute;
+        const xml = await getLibraryGpx(id);
+        if (active) showPending({ ...routeForPreview(xml, name), name }, Promise.resolve({ id, name }));
+      } else if (input?.send) {
+        const { name, points } = input.send;
+        showPending(routeForPreview(pointsToGpx(name, points), name));
+      }
+    }
+    load().catch(error => { if (active) Alert.alert(t.error, error?.message ?? t.unknownError); });
+    return () => { active = false; };
+  }, [importing, input]); // eslint-disable-line react-hooks/exhaustive-deps
+  // Bike computers around (desktop RoutesPage parity: "Send to Bryton" / "Send to Magene").
+  const [brytonPlugged, setBrytonPlugged] = useState(false);
+  // A Garmin Edge 500 opened by Home (USB drive): routes go in as a TCX course (2026-11-05).
+  const [edge500Here, setEdge500Here] = useState(false);
+  const [knownMagene, setMagene] = useState<KnownMagene | null>(null);
+  // Only while its switch is on (Settings > Show in the sidebar > Devices, 2026-10-22).
+  const { features: expFeatures } = useExperimental();
+  const magene = expFeatures.magene ? knownMagene : null;
+  const [bikeBusy, setBikeBusy] = useState('');
+  const [bikeMsg, setBikeMsg] = useState('');
+  useFocusEffect(useCallback(() => {
+    if (!importing) return;
+    detectBryton().then(d => setBrytonPlugged(d.plugged && d.granted)).catch(() => {});
+    getKnownMagene().then(setMagene).catch(() => {});
+    setEdge500Here(!!connectedEdge());
+  }, [importing]));
+  async function sendToBike(target: 'bryton' | 'magene' | 'edge500') {
+    if (!pending || bikeBusy || savingName) return;
+    setBikeBusy(target); setBikeMsg('');
+    try {
+      const gpx = pendingToGpx(pending);
+      if (target === 'edge500') {
+        await sendEdgeCourse(gpx, pending.name);
+        setBikeMsg('Sent to the Edge 500 ✓ — unplug it, then find it under Training › Courses.');
+      } else if (target === 'bryton') {
+        const r = await sendRouteToBryton(gpx, pending.name);
+        setBikeMsg(`“${r.name}” installed on the Bryton ✓ — Follow Track after unplugging.`);
+      } else {
+        const r = await sendRouteToMagene(magene!.address, gpx);
+        setBikeMsg(r.ok ? `Sent to the Magene C406 ✓ (it keeps one route)` : (r.error || 'Send failed'));
+      }
+    } catch (e: any) { setBikeMsg(String(e?.message ?? e)); } finally { setBikeBusy(''); }
+  }
+  const [picking, setPicking] = useState(false);
+  const [plannerOpen, setPlannerOpen] = useState(false);   // route-planner help dialog
+  // Anchor the dialog just below the "i" (like desktop) rather than centering it. We measure the
+  // badge's window position on tap and clamp so the card stays on screen.
+  const { width: winW } = useWindowDimensions();
+  const infoRef = useRef<View>(null);
+  const [anchor, setAnchor] = useState<{ x: number; y: number }>({ x: 12, y: 80 });
+  const CARD_W = Math.min(340, winW - 24);
+  const openPlanner = () => {
+    const node = infoRef.current;
+    if (node && node.measureInWindow) {
+      node.measureInWindow((x, y, _w, h) => {
+        setAnchor({
+          x: Math.max(12, Math.min(x, winW - CARD_W - 12)),
+          y: y + h + 6,
+        });
+        setPlannerOpen(true);
+      });
+    } else {
+      setPlannerOpen(true);
+    }
+  };
+  const [sendState, setSendState] = useState<SendRouteState>({ phase: 'idle' });
+  // The result of a send or a removal, as a note under its card (desktop picks #7, like
+  // RouteLibraryView's StatusNote) instead of a pop-up.
+  const [sendNote, setSendNote] = useState<{ text: string; tone: 'success' | 'error' } | null>(null);
+  const [removeNote, setRemoveNote] = useState<{ text: string; tone: 'success' | 'error' } | null>(null);
+  const sendBusy = sendState.phase === 'connecting' || sendState.phase === 'writing';
+
+  const [onWatch, setOnWatch] = useState<WatchRoute[] | null>(null);
+  const [onWatchLoading, setOnWatchLoading] = useState(false);
+  const [onWatchError, setOnWatchError] = useState<string | undefined>();
+  const [exportingIndex, setExportingIndex] = useState<number | null>(null);
+  const [removingName, setRemovingName] = useState<string | null>(null);
+  // Map/list view (persisted Settings pref) + in-page sort, same pattern as the Activities list.
+  const [viewMode, setViewMode] = useState<ViewMode>('map');
+  const [sortKey, setSortKey] = useState<SortKey>('name');
+  useFocusEffect(useCallback(() => { if (active && !importing) getViewMode('routes').then(setViewMode); }, [active, importing]));
+  function changeViewMode(m: ViewMode) { setViewMode(m); persistViewMode('routes', m); }
+  // Map view: square cards side by side (André, 2026-11-22, as on the desktop: "more square
+  // maps, and do like the activities do...little squares"); it was one full-width map strip
+  // per route. As many squares as fit at 140 wide (two on a phone), widened to fill the row.
+  // A card has room for one button; the rest of its actions are behind ⋯.
+  const GRID_GAP = v3Spacing.medium;
+  const [gridW, setGridW] = useState(0);
+  const perRow = Math.max(1, Math.floor((gridW + GRID_GAP) / (140 + GRID_GAP)));
+  const cellW = gridW > 0 ? Math.floor((gridW - GRID_GAP * (perRow - 1)) / perRow) : 0;
+  const onGridLayout = (e: { nativeEvent: { layout: { width: number } } }) => {
+    const w = Math.round(e.nativeEvent.layout.width);
+    if (w !== gridW) setGridW(w);
+  };
+  const [menu, setMenu] = useState<{ title: string; items: ActionMenuItem[] } | null>(null);
+  const sortedOnWatch = onWatch
+    ? sortItems(onWatch.map(r => ({ r, name: r.name, distanceM: r.distanceM, ascentM: r.ascentM })), sortKey).map(x => x.r)
+    : null;
+
+  // Real, 2026-08-10 ("it is not upon the watch to give you that, is on the app to store
+  // the activities, so they can load almost immediately and just refresh what is new") -
+  // the persisted cache (if any) renders instantly, with no loading spinner; the real watch
+  // read then runs in the background and silently updates the list when it lands. A cache
+  // miss (first ever use) falls back to the old spinner+error behavior - there's nothing to
+  // show instantly yet.
+  const loadOnWatch = useCallback(async () => {
+    const cached = await getCachedNavigation();
+    if (cached) {
+      setOnWatch(cached.routes);
+    } else {
+      setOnWatchLoading(true);
+    }
+    setOnWatchError(undefined);
+    try {
+      const nav = await readOnWatchNavigation();
+      setOnWatch(nav.routes);
+    } catch (e: any) {
+      // A failed background refresh shouldn't blank out a list we already have real,
+      // if possibly stale, data for - only surface the error when there's nothing to show.
+      if (!cached) setOnWatchError(e?.message ?? t.unknownError);
+    } finally {
+      setOnWatchLoading(false);
+    }
+  }, []);
+
+  useFocusEffect(useCallback(() => { if (active && !importing && watchHere) loadOnWatch(); }, [active, importing, loadOnWatch, watchHere]));
+
+  function importPicked(picked: { xml: string; name: string }) {
+    const route = routeForPreview(picked.xml, picked.name);
+    const saved = saveToLibrary(route.name, picked.xml, {
+      distanceM: route.distanceM, ascentM: route.ascentM, points: route.points,
+    }, { preserveExistingName: true });
+    showPending(route, saved);
+    saved.then(() => syncLibrariesSoon()).catch(() => {});
+  }
+
+  const pickingRef = useRef(false);
+  async function handlePick() {
+    if (pickingRef.current || sendBusy || savingName) return;
+    pickingRef.current = true;
+    try {
+      const selection = pickRouteGpx();
+      setPicking(true);
+      const picked = await selection;
+      if (picked) importPicked(picked);
+    } catch (e: any) {
+      Alert.alert(t.error, e?.message ?? t.unknownError);
+    } finally {
+      pickingRef.current = false;
+      setPicking(false);
+    }
+  }
+
+  function handleUpload() {
+    if (!pending || sendBusy || savingName) return;
+    if (filtered && filtered.length > MAX_ROUTE_POINTS) {
+      Alert.alert(t.error, t.routeFilterTooMany);
+      return;
+    }
+    let route: PendingRoute;
+    try {
+      route = prepareUpload(filtered ? retargetRoutePoints(pending, filtered) : pending);
+    } catch (e: any) {
+      Alert.alert(t.error, e?.message ?? t.unknownError);
+      return;
+    }
+    const sourceCount = filtered?.length ?? pending.points.length;
+    const message = route.points.length < sourceCount
+      ? `${t.sendRouteConfirmMsgKeep}\n\n${t.routeWatchPointLimit(route.points.length, sourceCount)}`
+      : t.sendRouteConfirmMsgKeep;
+    Alert.alert(t.sendRouteConfirmTitle, message, [
+      { text: t.cancel, style: 'cancel' },
+      { text: t.sendRouteConfirmBtn, onPress: () => runUpload(route) },
+    ]);
+  }
+
+  async function runUpload(route: PendingRoute) {
+    // The last state the send reported says how it ended. When it worked, say so, as removing a
+    // route already does (F23).
+    let last: SendRouteState = { phase: 'idle' };
+    setSendNote(null);
+    try {
+      await uploadRoute(route, s => { last = s; setSendState(s); }, { legacy: params.legacy ?? false });
+    } catch (e: any) {
+      setSendNote({ text: e?.message ?? t.unknownError, tone: 'error' });
+      setSendState({ phase: 'error', error: e?.message });
+      return;
+    }
+    if (last.phase === 'done') {
+      setPreview(null);
+      setSendNote({ text: t.routeSent(route.name), tone: 'success' });
+    } else if (last.phase === 'error') {
+      setSendNote({ text: last.error ?? t.unknownError, tone: 'error' });
+    }
+  }
+
+  function handleRemoveItem(route: WatchRoute) {
+    if (removingName !== null) return;
+    Alert.alert(t.routeRemoveTitle, t.routeRemoveConfirm(route.name), [
+      { text: t.cancel, style: 'cancel' },
+      { text: t.routeItemRemoveBtn, style: 'destructive', onPress: async () => {
+        setRemovingName(route.name);
+        setRemoveNote(null);
+        try {
+          await removeRouteFromWatch(route.name);
+          setRemoveNote({ text: t.routeRemoved(route.name), tone: 'success' });
+        } catch (e: any) {
+          setRemoveNote({ text: e?.message ?? t.unknownError, tone: 'error' });
+        } finally {
+          setRemovingName(null);
+          loadOnWatch();
+        }
+      } },
+    ]);
+  }
+
+  async function handleExportItem(route: WatchRoute, index: number) {
+    if (exportingIndex !== null) return;
+    setExportingIndex(index);
+    try {
+      await exportSingleRouteToGpx(route);
+    } catch (e: any) {
+      Alert.alert(t.error, e?.message ?? t.unknownError);
+    } finally {
+      setExportingIndex(null);
+    }
+  }
+
+  // Export all (desktop parity, 2026-11-13): every route of the source shown, one GPX each, into
+  // a new folder in Downloads. The watch's routes are already read; the Library's are read here.
+  const [exportAllMsg, setExportAllMsg] = useState<{ text: string; tone: 'working' | 'success' | 'error' } | null>(null);
+  const stopExportAll = useRef(false);
+  const exportAllBusy = exportAllMsg?.tone === 'working';
+  async function runExportAll() {
+    const items = source === 1
+      ? library.map(r => ({ name: r.name, gpx: () => getLibraryGpx(r.id) }))
+      : (sortedOnWatch ?? []).map(r => ({ name: r.name, gpx: async () => navigationToGpx({ routes: [r], waypoints: [] }) }));
+    if (!items.length) return;
+    stopExportAll.current = false;
+    setExportAllMsg({ text: `Saving 0 of ${items.length}…`, tone: 'working' });
+    const res = await exportRoutesToDownloads(items,
+      (done, total) => setExportAllMsg({ text: `Saving ${done} of ${total}…`, tone: 'working' }),
+      () => stopExportAll.current);
+    let text = `Saved ${res.saved === 1 ? '1 GPX file' : `${res.saved} GPX files`} in Downloads/${res.folder}.`;
+    if (res.failed.length) text += ` Not saved: ${res.failed.join(', ')}.`;
+    if (stopExportAll.current && res.saved + res.failed.length < items.length) text += ' Stopped.';
+    setExportAllMsg({ text, tone: res.failed.length ? 'error' : 'success' });
+  }
+  function askExportAll() {
+    if (exportAllBusy) { stopExportAll.current = true; return; }
+    const n = source === 1 ? library.length : (sortedOnWatch?.length ?? 0);
+    Alert.alert('Export all routes',
+      `Saves the ${n === 1 ? 'route' : `${n} routes`} listed into a new folder in Downloads, one GPX file each, named after the route.`,
+      [{ text: t.cancel, style: 'cancel' }, { text: 'Export', onPress: runExportAll }]);
+  }
+
+  return (
+    <LockableScrollView ref={scrollRef} style={styles.root} contentInsetAdjustmentBehavior="automatic" contentContainerStyle={styles.content}>
+
+      {importing && <>
+      {/* Route-planner help dialog - the tools that produce a GPX this screen can import.
+          Links open in the browser (Linking.openURL), matching desktop's RoutesPage. */}
+      <Modal visible={plannerOpen} transparent animationType="fade" onRequestClose={() => setPlannerOpen(false)}>
+        <Pressable style={styles.backdrop} onPress={() => setPlannerOpen(false)}>
+          <Pressable style={[styles.dialogCard, { position: 'absolute', left: anchor.x, top: anchor.y, width: CARD_W }]} onPress={() => {}}>
+            <Text style={styles.dialogTitle}>{t.routePlannerTitle}</Text>
+            <Text style={[styles.dialogText, { fontWeight: '700', marginTop: 4 }]}>{t.routeWatchNote}</Text>
+            <Text style={styles.dialogText}>{t.routePlannerIntro}</Text>
+            {[
+              { name: 'Suunto planner', qual: t.routePlannerOnline, url: 'https://routeplanner.suunto.com/' },
+              { name: 'Komoot', qual: t.routePlannerOnline, url: 'https://www.komoot.com/' },
+              { name: 'Openrunner', qual: t.routePlannerOnline, url: 'https://www.openrunner.com/' },
+              { name: 'Garmin Basecamp', qual: t.routePlannerOfflineWinMac, url: 'https://www.garmin.com/en-GB/software/basecamp/' },
+              { name: 'Qmapshack', qual: t.routePlannerOfflineAll, url: 'https://github.com/Maproom/qmapshack' },
+              { name: 'Maps for Basecamp/garmin devices', qual: '', url: 'http://www.frikart.no/garmin/index.html' },
+              { name: 'Maps for Basecamp/Qmapshack', qual: '', url: 'https://download2.bbbike.org/osm/' },
+            ].map(p => (
+              <TouchableOpacity key={p.url} style={styles.dialogLinkRow} onPress={() => Linking.openURL(p.url)}>
+                <Text style={styles.dialogLink}>•  {p.name} </Text>
+                {!!p.qual && <Text style={styles.dialogMuted}>{p.qual}</Text>}
+              </TouchableOpacity>
+            ))}
+            <TouchableOpacity style={styles.dialogClose} onPress={() => setPlannerOpen(false)}>
+              <Text style={styles.dialogCloseText}>{t.close}</Text>
+            </TouchableOpacity>
+          </Pressable>
+        </Pressable>
+      </Modal>
+
+      {/* ── Import a route ── */}
+      <Card style={{ width: '100%' }}>
+        {/* Title + a "little i" that opens the route-planner help dialog (André, 2026-08-16),
+            same affordance as desktop's RoutesPage. */}
+        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+          <Text style={styles.cardTitle}>{t.routeSendSection}</Text>
+          <TouchableOpacity ref={infoRef} style={styles.infoBadge} onPress={openPlanner} hitSlop={8}>
+            <Text style={styles.infoBadgeText}>i</Text>
+          </TouchableOpacity>
+        </View>
+        <View style={[styles.row, { marginTop: v3Spacing.small }]}>
+          <Button label={t.routeIdle} variant="filled" loading={picking} disabled={picking || sendBusy || savingName} onPress={handlePick} />
+          {/* A real button, not bare text (André, 2026-10-03: "'Open planner' looks like plain
+              text"); the first one says what it does - it opens the file picker - instead of
+              repeating the card's title. */}
+          <Button label="Open planner" variant="outline" onPress={() => navigation.navigate('RouteWeather')} />
+        </View>
+        {!pending && sendNote && <StatusNote text={sendNote.text} tone={sendNote.tone} />}
+
+        {preview && pending && (
+          <View style={{ marginTop: v3Spacing.medium, gap: v3Spacing.small }}>
+            <RouteMapProfile key={preview.key} points={pending.points} filtered={filtered} flushMap showSlopeControl />
+            <View style={styles.row}>
+              <Text style={[styles.itemName, styles.previewName]}>{pending.name}</Text>
+              <Button label={t.routeRename} variant="text" grow={false} loading={savingName}
+                disabled={savingName || picking || sendBusy || !!bikeBusy} onPress={editPreviewName} />
+            </View>
+            <Text style={styles.itemStats}>
+              {t.routeStats(formatDist(pending.distanceM), pending.points.length, pending.ascentM, pending.descentM)}
+            </Text>
+            <RouteSpacingControl enabled={filterEnabled} onEnabled={setFilterEnabled}
+              meters={spacing} onMeters={setSpacing} kept={filtered?.length ?? pending.points.length}
+              total={pending.points.length} disabled={sendBusy} />
+            <View style={styles.row}>
+              {watchHere && <Button label={t.routeUploadBtn} variant="filled" loading={sendBusy} disabled={sendBusy || savingName} onPress={handleUpload} />}
+              <Button label="Open in planner" variant="text" grow={false} disabled={sendBusy || savingName}
+                onPress={() => openInPlanner(pending.name, pending.points.map(p => ({ lat: p.lat, lon: p.lon, ele: p.alt })))} />
+              <Button label={t.routeDiscardBtn} variant="text" grow={false} disabled={sendBusy || savingName} onPress={() => setPreview(null)} />
+            </View>
+            {(brytonPlugged || magene || edge500Here) && (
+              <View style={styles.row}>
+                {brytonPlugged && <Button label="Send to Bryton" variant="text" grow={false} busy={bikeBusy === 'bryton'}
+                  disabled={!!bikeBusy || savingName} onPress={() => sendToBike('bryton')} />}
+                {edge500Here && <Button label="Send to Garmin Edge 500" variant="text" grow={false} busy={bikeBusy === 'edge500'}
+                  disabled={!!bikeBusy || savingName} onPress={() => sendToBike('edge500')} />}
+                {magene && <Button label="Send to Magene" variant="text" grow={false} busy={bikeBusy === 'magene'}
+                  disabled={!!bikeBusy || savingName} onPress={() => sendToBike('magene')} />}
+              </View>
+            )}
+            <StatusNote text={bikeMsg} tone={bikeMsg.includes('✓') ? 'success' : 'error'} />
+            {sendBusy && <StatusNote text={sendState.phase === 'connecting' ? t.connecting : t.routeWritingMsg} tone="working" />}
+            {sendNote && <StatusNote text={sendNote.text} tone={sendNote.tone} />}
+          </View>
+        )}
+      </Card>
+
+      </>}
+      {!importing && <>
+      {/* ── One source at a time: the watch or the Library (desktop's drop-down) ── */}
+      <Card style={{ width: '100%' }}>
+        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 12 }}>
+          {watchHere
+            ? <Dropdown value={source} onSelect={setSource}
+                choices={[{ value: 0, label: t.routeOnWatchSection }, { value: 1, label: 'Library' }]} />
+            : <Text style={styles.cardTitle}>Library</Text>}
+          {(source === 1 ? library.length > 0 : (!onWatchLoading && sortedOnWatch && sortedOnWatch.length > 0)) && (
+            <ViewModeToggle mode={viewMode} onChange={changeViewMode} />
+          )}
+          {(source === 1 ? library.length > 0 : (!onWatchLoading && sortedOnWatch && sortedOnWatch.length > 0)) && (
+            <TouchableOpacity onPress={askExportAll} hitSlop={8} accessibilityLabel="Export all routes">
+              <Text style={styles.exportAllLink}>{exportAllBusy ? 'Stop' : 'Export all…'}</Text>
+            </TouchableOpacity>
+          )}
+        </View>
+        {exportAllMsg && <StatusNote text={exportAllMsg.text} tone={exportAllMsg.tone} />}
+
+        {source === 1 && library.length === 0 && (
+          <EmptyState icon="route" title={t.routeLibraryEmptyTitle} text={t.routeLibraryEmptyText}
+            actionLabel={t.routeImportTitle} onAction={() => navigation.navigate('RouteImport')} />
+        )}
+        {source === 1 && viewMode === 'map' && library.length > 0 && (
+          <View onLayout={onGridLayout} style={styles.grid}>
+            {cellW > 0 && library.map(r => (
+              <View key={r.id} style={{ width: cellW, gap: 4 }}>
+                <Pressable accessibilityRole="button" accessibilityLabel={r.name}
+                  onPress={() => navigation.navigate('RouteDetail', { name: r.name, libraryId: r.id })}>
+                  <View pointerEvents="none" style={{ gap: 4 }}>
+                    <TrackPreview points={r.preview} height={cellW} trackWidth={2} interactive={false} />
+                    <Text style={styles.itemName} numberOfLines={1}>{r.name}</Text>
+                    <Text style={styles.itemStats} numberOfLines={2}>{formatDist(r.distanceMeters)} · +{r.ascentMeters} m</Text>
+                  </View>
+                </Pressable>
+                <View style={styles.row}>
+                  <View style={{ flex: 1 }}>
+                    <Button label="Send…" disabled={sendBusy} onPress={() => libSend(r)} style={styles.cardButton} />
+                  </View>
+                  <Button label="⋯" grow={false} style={styles.cardButton} onPress={() => setMenu({ title: r.name, items: [
+                    { label: 'Open in planner', onPress: () => libOpen(r) },
+                    { label: 'Send…', onPress: () => libSend(r), disabled: sendBusy },
+                    { label: 'Rename', onPress: () => setRenaming({ id: r.id, value: r.name }) },
+                    { label: 'Delete', tone: 'alert', onPress: () => libDelete(r) },
+                  ] })} />
+                </View>
+              </View>
+            ))}
+          </View>
+        )}
+        {source === 1 && viewMode !== 'map' && library.map((r, i) => (
+          <View key={r.id} style={i > 0 ? styles.onWatchItem : { marginTop: v3Spacing.medium, gap: v3Spacing.small }}>
+            <Pressable accessibilityRole="button" accessibilityLabel={r.name}
+              onPress={() => navigation.navigate('RouteDetail', { name: r.name, libraryId: r.id })}>
+              <Text style={styles.itemName}>{r.name}</Text>
+              <Text style={styles.itemStats}>{formatDist(r.distanceMeters)} · +{r.ascentMeters} m</Text>
+            </Pressable>
+            <View style={[styles.row, { flexWrap: 'wrap' }]}>
+              <Button label="Open in planner" variant="text" grow={false} onPress={() => libOpen(r)} />
+              <Button label="Send…" variant="text" grow={false} disabled={sendBusy} onPress={() => libSend(r)} />
+              <Button label="Rename" variant="text" grow={false} onPress={() => setRenaming({ id: r.id, value: r.name })} />
+              <Button label="Delete" variant="text" danger grow={false} onPress={() => libDelete(r)} />
+            </View>
+          </View>
+        ))}
+
+        {source === 0 && watchHere && (<>
+
+        {onWatchLoading && (
+          <StatusNote text={t.routeOnWatchReading} tone="working" />
+        )}
+        {!onWatchLoading && onWatchError && (
+          <StatusNote text={t.routeOnWatchError(onWatchError)} tone="error" />
+        )}
+        {removeNote && <StatusNote text={removeNote.text} tone={removeNote.tone} />}
+        {!onWatchLoading && !onWatchError && onWatch && onWatch.length === 0 && (
+          <EmptyState icon="route" title={t.routeOnWatchEmptyTitle} />
+        )}
+
+        {!onWatchLoading && sortedOnWatch && sortedOnWatch.length > 1 && (
+          <SortBar keys={sortKeysFor('routes')} value={sortKey} onChange={setSortKey} />
+        )}
+
+        {!onWatchLoading && sortedOnWatch && viewMode === 'map' && sortedOnWatch.length > 0 && (
+          <View onLayout={onGridLayout} style={styles.grid}>
+            {cellW > 0 && sortedOnWatch.map((route, i) => (
+              <View key={`${route.name}-${i}`} style={{ width: cellW, gap: 4 }}>
+                <Pressable accessibilityRole="button" accessibilityLabel={route.name}
+                  onPress={() => navigation.navigate('RouteDetail', { name: route.name, watchRoute: route })}>
+                  <View pointerEvents="none" style={{ gap: 4 }}>
+                    <TrackPreview points={route.points.map(p => ({ lat: p.latitude, lon: p.longitude }))}
+                      height={cellW} trackWidth={2} interactive={false} />
+                    <Text style={styles.itemName} numberOfLines={1}>{route.name}</Text>
+                    <Text style={styles.itemStats} numberOfLines={2}>
+                      {t.routeStats(formatDist(route.distanceM), route.points.length, route.ascentM, route.descentM)}
+                    </Text>
+                  </View>
+                </Pressable>
+                <View style={styles.row}>
+                  <View style={{ flex: 1 }}>
+                    <Button label={t.routeItemExportBtn} busy={exportingIndex === i} disabled={exportingIndex !== null}
+                      onPress={() => handleExportItem(route, i)} style={styles.cardButton} />
+                  </View>
+                  <Button label="⋯" grow={false} style={styles.cardButton} onPress={() => setMenu({ title: route.name, items: [
+                    { label: t.routeItemExportBtn, onPress: () => handleExportItem(route, i), disabled: exportingIndex !== null },
+                    { label: 'Open in planner', visible: route.points.length > 1,
+                      onPress: () => openInPlanner(route.name, route.points.map(p => ({ lat: p.latitude, lon: p.longitude, ele: null }))) },
+                    { label: t.routeItemRemoveBtn, tone: 'alert', disabled: removingName !== null || onWatchLoading,
+                      onPress: () => handleRemoveItem(route) },
+                  ] })} />
+                </View>
+              </View>
+            ))}
+          </View>
+        )}
+        {!onWatchLoading && sortedOnWatch && viewMode !== 'map' && sortedOnWatch.map((route, i) => (
+          <View key={`${route.name}-${i}`} style={i > 0 ? styles.onWatchItem : { marginTop: v3Spacing.medium, gap: v3Spacing.small }}>
+            <View style={styles.row}>
+              <Pressable style={{ flex: 1 }} accessibilityRole="button" accessibilityLabel={route.name}
+                onPress={() => navigation.navigate('RouteDetail', { name: route.name, watchRoute: route })}>
+                <Text style={styles.itemName}>{route.name}</Text>
+                <Text style={styles.itemStats}>
+                  {t.routeStats(formatDist(route.distanceM), route.points.length, route.ascentM, route.descentM)}
+                </Text>
+              </Pressable>
+              <Button label={t.routeItemExportBtn} grow={false} busy={exportingIndex === i}
+                disabled={exportingIndex !== null} onPress={() => handleExportItem(route, i)}
+                style={{ paddingVertical: 6, paddingHorizontal: 12 }} />
+              <Button label={t.routeItemRemoveBtn} grow={false} danger busy={removingName === route.name}
+                disabled={removingName !== null || onWatchLoading} onPress={() => handleRemoveItem(route)}
+                style={{ paddingVertical: 6, paddingHorizontal: 12 }} />
+            </View>
+            {route.points.length > 1 && (
+              <Button label="Open in planner" variant="text" grow={false}
+                onPress={() => openInPlanner(route.name, route.points.map(p => ({ lat: p.latitude, lon: p.longitude, ele: null })))} />
+            )}
+          </View>
+        ))}
+        </>)}
+      </Card>
+
+      {/* A square card's ⋯ */}
+      <ActionMenu visible={menu != null} title={menu?.title} items={menu?.items ?? []} onClose={() => setMenu(null)} />
+
+      {/* Rename a Library route */}
+      <Modal visible={renaming != null} transparent animationType="fade" onRequestClose={() => setRenaming(null)}>
+        <Pressable style={[styles.backdrop, { justifyContent: 'center', padding: v3Spacing.large }]} onPress={() => setRenaming(null)}>
+          <Pressable style={styles.dialogCard} onPress={() => {}}>
+            <Text style={styles.dialogTitle}>Rename route</Text>
+            <TextInput style={styles.renameInput} autoFocus value={renaming?.value ?? ''}
+              onChangeText={v => setRenaming(x => x && { ...x, value: v })} placeholderTextColor={theme.mutedText} />
+            <View style={[styles.row, { justifyContent: 'flex-end' }]}>
+              <Button label={t.cancel} variant="text" grow={false} onPress={() => setRenaming(null)} />
+              <Button label="OK" variant="text" grow={false} onPress={() => {
+                const x = renaming; setRenaming(null);
+                if (x) renameLibraryRoute(x.id, x.value).then(() => { refreshLibrary(); syncLibrariesSoon(refreshLibrary); });
+              }} />
+            </View>
+          </Pressable>
+        </Pressable>
+      </Modal>
+
+      </>}
+    </LockableScrollView>
+  );
+}
+
+const createStyles = (t: ReturnType<typeof useV3Theme>) => StyleSheet.create({
+  root: { flex: 1, backgroundColor: t.background },
+  content: { width: '100%', maxWidth: 850, alignSelf: 'center', padding: v3Spacing.page, gap: 10 },
+  cardTitle: { fontSize: v3Type.heading, fontWeight: '700', color: t.text },
+  // "little i" info badge next to the title (matches desktop's RoutesPage).
+  infoBadge: {
+    width: 15, height: 15, borderRadius: 7.5,
+    borderWidth: 1, borderColor: t.mutedText,
+    alignItems: 'center', justifyContent: 'center',
+  },
+  infoBadgeText: { fontSize: 10, fontWeight: '700', color: t.mutedText, lineHeight: 11 },
+  // Route-planner help dialog.
+  // Full-screen dimmer only; the card is absolutely positioned near the "i" (padding here would
+  // offset the card's left/top, so keep it at 0).
+  backdrop: { flex: 1, backgroundColor: '#00000066' },
+  dialogCard: {
+    backgroundColor: t.card, borderRadius: 22,
+    borderWidth: StyleSheet.hairlineWidth, borderColor: t.border,
+    padding: v3Spacing.medium, gap: v3Spacing.small,
+  },
+  dialogTitle: { fontSize: v3Type.bodyLarge, fontWeight: '700', color: t.text },
+  dialogText: { fontSize: v3Type.body, color: t.text, marginTop: 2 },
+  dialogLinkRow: { flexDirection: 'row', alignItems: 'center', flexWrap: 'wrap', paddingVertical: 4 },
+  dialogLink: { fontSize: v3Type.body, color: t.primary, fontWeight: '600' },
+  dialogMuted: { fontSize: v3Type.body, color: t.mutedText },
+  // Close on the last line's right corner to save space (André, 2026-08-16).
+  dialogClose: { position: 'absolute', right: 10, bottom: 8, paddingVertical: 4, paddingHorizontal: 8 },
+  dialogCloseText: { fontSize: v3Type.body, color: t.primary, fontWeight: '700' },
+  row: { flexDirection: 'row', alignItems: 'center', gap: v3Spacing.small },
+  itemName: { flexShrink: 1, fontSize: v3Type.subtitle, fontWeight: '700', color: t.text },
+  previewName: { flex: 1 },
+  grid: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginTop: 10 },
+  cardButton: { paddingVertical: 6, paddingHorizontal: 10 },
+  itemStats: { fontSize: v3Type.label, color: t.mutedText, marginTop: 3, fontVariant: ['tabular-nums'] },
+  exportAllLink: { fontSize: v3Type.label, color: t.primary, fontWeight: '600' },
+  onWatchItem: { marginTop: v3Spacing.large, paddingTop: v3Spacing.medium, borderTopWidth: 1, borderTopColor: t.mutedText + '22', gap: v3Spacing.small },
+  exportBtn: {
+    paddingVertical: 8, paddingHorizontal: 12, borderRadius: 8,
+    backgroundColor: t.primary + '1F', borderWidth: 1, borderColor: t.primary,
+  },
+  exportBtnText: { color: t.primary, fontWeight: '600', fontSize: v3Type.label },
+  renameInput: { borderWidth: 1, borderColor: t.mutedText + '55', borderRadius: 10, color: t.text,
+                 paddingHorizontal: 12, paddingVertical: 8, fontSize: v3Type.body, marginVertical: v3Spacing.small },
+});

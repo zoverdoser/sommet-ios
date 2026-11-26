@@ -1,0 +1,736 @@
+import SQLite, { SQLiteDatabase } from 'react-native-sqlite-storage';
+import RNFS from 'react-native-fs';
+import { canonicalSportName, isJunkActivity, JUNK_MAX_S, JUNK_MAX_M, HIDE_SHORT_TEST_ACTIVITIES } from '../services/SportNames';
+
+SQLite.enablePromise(true);
+
+// iOS moves the app's data container (its UUID changes between some installs), so a gpx_path
+// stored as an ABSOLUTE path under an old container stops resolving → "can't read gpx". Rebase
+// any stored `.../Documents/<rel>` onto the CURRENT DocumentDirectoryPath so the file is found
+// wherever this install put it. (André, 2026-08-30.)
+function rebaseToDocuments(p: string | null | undefined): string {
+  if (!p) return p ?? '';
+  const marker = '/Documents/';
+  const i = p.indexOf(marker);
+  if (i === -1) return p;
+  return `${RNFS.DocumentDirectoryPath}/${p.slice(i + marker.length)}`;
+}
+
+// ─── Types ────────────────────────────────────────────────────────────────────
+
+export interface ActivityRecord {
+  id: string;
+  synced_at: number;      // timestamp Unix (ms)
+  gpx_path: string;
+  date: string;           // ISO 8601, ex: "2024-06-15T09:30:00"
+  duration_s: number;     // durée en secondes
+  distance_m: number;     // distance en mètres
+  d_plus: number;         // dénivelé positif cumulé (m)
+  activity_type: string;  // ex: "Orienteering", "Running"…
+  // Which device recorded it, when known (2026-08-26, desktop parity: "we also added from what
+  // device they came from, and I don't see it"). intervals.icu imports carry a real name here
+  // ("GARMIN FR965", "SUUNTO Suunto Race S"); moves read off the connected watch leave it empty,
+  // because the watch is implied.
+  device?: string;
+  // Calories, when the source gives them (2026-10-03: intervals.icu sends them for every
+  // activity; a move rebuilt from a GPX has none, the GPX carries no energy).
+  energy_kcal?: number;
+  // Sommet Sync (#SYNC-3): last-modified time (ms), drives last-writer-wins against the shared
+  // self-hosted store. Defaults to synced_at on a watch read; a pulled row carries the origin's.
+  updated_at?: number;
+  // The true UTC start (epoch s) when `date` is a local time without a zone (intervals.icu's
+  // start_date_local). The duplicate check (SameMove.ts) compares starts in UTC only. 0 = unknown.
+  start_utc?: number;
+  // Moving time (s): the FIT's timer time, beside duration_s (its total time) - sync/06,
+  // 2026-11-18. The Coach's own load counts this one. 0 = not known.
+  moving_s?: number;
+  // Light library (sync/13): 1 = this move's Track is kept on the server (the NAS or
+  // intervals.icu), not here; it is fetched when the move is opened. track_cached_at = when an
+  // opened older move's Track was fetched back (ms); those count against the size limit.
+  track_remote?: number;
+  track_cached_at?: number;
+}
+
+// ─── Singleton DB ─────────────────────────────────────────────────────────────
+
+let _db: Promise<SQLiteDatabase> | null = null;
+
+// One open + setup, shared by every caller. It used to keep the database as soon as the file
+// opened, so the screens asking for it at start-up each ran the whole setup at the same time
+// (every ADD COLUMN twice in the tablet's log, 2026-10-23), and a caller arriving mid-setup got
+// the database before its new columns existed. A failed open isn't kept: the next call retries.
+export function getDb(): Promise<SQLiteDatabase> {
+  if (!_db) _db = openAndMigrate().catch(e => { _db = null; throw e; });
+  return _db;
+}
+
+// Adds the columns a table created by an earlier build is missing. Asks first: a plain ADD COLUMN
+// on a column that's there fails, and although that failure was swallowed, SQLite logged it with
+// a stack trace, 21 of them on every start.
+async function addMissingColumns(db: SQLiteDatabase, table: string, columns: [string, string][]) {
+  const [res] = await db.executeSql(`PRAGMA table_info(${table})`);
+  const have = new Set<string>();
+  for (let i = 0; i < res.rows.length; i++) have.add(res.rows.item(i).name);
+  for (const [name, decl] of columns) {
+    if (!have.has(name)) await db.executeSql(`ALTER TABLE ${table} ADD COLUMN ${name} ${decl}`).catch(() => {});
+  }
+}
+
+async function openAndMigrate(): Promise<SQLiteDatabase> {
+  const db = await SQLite.openDatabase({ name: 'ambitsync.db', location: 'default' });
+  await db.executeSql(`
+    CREATE TABLE IF NOT EXISTS activities (
+      id            TEXT    PRIMARY KEY,
+      synced_at     INTEGER NOT NULL,
+      gpx_path      TEXT    NOT NULL,
+      date          TEXT    NOT NULL DEFAULT '',
+      duration_s    INTEGER NOT NULL DEFAULT 0,
+      distance_m    INTEGER NOT NULL DEFAULT 0,
+      d_plus        INTEGER NOT NULL DEFAULT 0,
+      activity_type TEXT    NOT NULL DEFAULT ''
+    )
+  `);
+  // Table liste noire : activités supprimées volontairement, ne jamais re-importer
+  await db.executeSql(`
+    CREATE TABLE IF NOT EXISTS deleted_activities (
+      id         TEXT    PRIMARY KEY,
+      deleted_at INTEGER NOT NULL
+    )
+  `);
+  // Sommet Sync (#SYNC-3): tombstones keyed by the cross-device uid (device|start-minute), the
+  // same identity the desktop uses. Separate from deleted_activities (keyed by the local id): the
+  // shared store identifies a record by uid, so a delete pushes/pulls by uid. Rows whose uid is
+  // here are never re-created by a pull, and are deleted locally when a remote tombstone arrives.
+  await db.executeSql(`
+    CREATE TABLE IF NOT EXISTS sommet_deleted (
+      uid TEXT PRIMARY KEY
+    )
+  `);
+  // Sync ledger (#SYNC-8/9/11, like desktop's sommet_ledger): which version (updated_at) of each
+  // move the server already holds, and which tombstones it was sent. A sync sends only what is
+  // missing here, instead of every move and every tombstone each time.
+  await db.executeSql(`
+    CREATE TABLE IF NOT EXISTS sommet_ledger (
+      uid TEXT PRIMARY KEY,
+      sent_updated_at INTEGER NOT NULL
+    )
+  `);
+  await db.executeSql(`
+    CREATE TABLE IF NOT EXISTS sommet_deleted_sent (
+      uid TEXT PRIMARY KEY
+    )
+  `);
+  // Migrations
+  await addMissingColumns(db, 'activities', [
+    ['activity_type', `TEXT NOT NULL DEFAULT ''`],
+    ['device', `TEXT NOT NULL DEFAULT ''`],
+    ['updated_at', 'INTEGER NOT NULL DEFAULT 0'],
+    ['energy_kcal', 'INTEGER NOT NULL DEFAULT 0'],
+    ['start_utc', 'INTEGER NOT NULL DEFAULT 0'],
+    ['moving_s', 'INTEGER NOT NULL DEFAULT 0'],
+    ['track_remote', 'INTEGER NOT NULL DEFAULT 0'],
+    ['track_cached_at', 'INTEGER NOT NULL DEFAULT 0'],
+  ]);
+  await tidyImportedActivities(db).catch(() => {});
+  // ── Gear tracker (v3) — see gearDb.ts. Local-first, mirrored to intervals.icu. ──
+  // A component (part) is a gear row with parent_id set. remote_id is the intervals.icu id
+  // once mirrored (null for local-only, not-yet-pushed rows). last_synced_at + a stored
+  // snapshot of the remote state let the mirror tell a one-sided edit from a real conflict.
+  await db.executeSql(`
+    CREATE TABLE IF NOT EXISTS gear (
+      id            TEXT    PRIMARY KEY,           -- local id (uuid or the remote id)
+      remote_id     TEXT,                          -- intervals.icu id, null until pushed
+      parent_id     TEXT,                          -- parent gear's local id, null for top gear
+      name          TEXT    NOT NULL DEFAULT '',
+      type          TEXT    NOT NULL DEFAULT 'bike',
+      distance_m    INTEGER NOT NULL DEFAULT 0,    -- read-only mirror of remote total
+      time_s        INTEGER NOT NULL DEFAULT 0,
+      retired       INTEGER NOT NULL DEFAULT 0,
+      is_primary    INTEGER NOT NULL DEFAULT 0,
+      updated_at    INTEGER NOT NULL DEFAULT 0,    -- local last-edit (ms)
+      last_synced_at INTEGER NOT NULL DEFAULT 0,
+      remote_snapshot TEXT   NOT NULL DEFAULT '',  -- JSON of remote state at last sync
+      deleted       INTEGER NOT NULL DEFAULT 0     -- tombstone (push delete, then purge)
+    )
+  `);
+  // Reminder intervals mirror intervals.icu exactly (a reminder can combine several units):
+  // distance (m), time (s), days, activities. percent_used (>=100 => due) comes from the server.
+  await db.executeSql(`
+    CREATE TABLE IF NOT EXISTS gear_reminder (
+      id            TEXT    PRIMARY KEY,
+      remote_id     TEXT,
+      gear_id       TEXT    NOT NULL,
+      name          TEXT    NOT NULL DEFAULT '',
+      distance_m    REAL    NOT NULL DEFAULT 0,
+      time_s        REAL    NOT NULL DEFAULT 0,
+      days          INTEGER NOT NULL DEFAULT 0,
+      activities    INTEGER NOT NULL DEFAULT 0,
+      percent_used  REAL    NOT NULL DEFAULT 0,
+      snoozed_until INTEGER,                             -- epoch ms, null if not snoozed
+      -- reset-baseline: the gear's cumulative counters at last reset, for LOCAL due-ness
+      starting_distance_m REAL    NOT NULL DEFAULT 0,
+      starting_time_s     REAL    NOT NULL DEFAULT 0,
+      starting_activities INTEGER NOT NULL DEFAULT 0,
+      last_reset          INTEGER,                       -- epoch ms of last reset
+      updated_at    INTEGER NOT NULL DEFAULT 0,
+      deleted       INTEGER NOT NULL DEFAULT 0
+    )
+  `);
+  // Idempotent migrations for tables created by an EARLIER gear build (CREATE TABLE IF NOT
+  // EXISTS won't add columns to a table that already exists). A DB that predates any of these
+  // columns is missing them -> "table gear_reminder has no column named distance_m" on insert.
+  // Each column is only added when it's missing, so running them every launch is safe. The
+  // reset-baseline set was already here; the core interval + sync columns (distance_m/time_s/
+  // days/activities/percent_used/snoozed_until/remote_id) were missing, which is the real bug
+  // the gear import hit (André's tablet, 2026-08-18).
+  await addMissingColumns(db, 'gear_reminder', [
+    ['distance_m', 'REAL NOT NULL DEFAULT 0'],
+    ['time_s', 'REAL NOT NULL DEFAULT 0'],
+    ['days', 'INTEGER NOT NULL DEFAULT 0'],
+    ['activities', 'INTEGER NOT NULL DEFAULT 0'],
+    ['percent_used', 'REAL NOT NULL DEFAULT 0'],
+    ['snoozed_until', 'INTEGER'],
+    ['remote_id', 'TEXT'],
+    ['starting_distance_m', 'REAL NOT NULL DEFAULT 0'],
+    ['starting_time_s', 'REAL NOT NULL DEFAULT 0'],
+    ['starting_activities', 'INTEGER NOT NULL DEFAULT 0'],
+    ['last_reset', 'INTEGER'],
+  ]);
+  // Sommet Sync (#SYNC-4): manually-entered mileage baseline on a gear + the moment it was set,
+  // parity with desktop so a baseline typed on the computer reaches the phone. Additive no-ops.
+  await addMissingColumns(db, 'gear', [
+    ['starting_distance_m', 'REAL NOT NULL DEFAULT 0'],
+    ['starting_time_s', 'REAL NOT NULL DEFAULT 0'],
+    ['baseline_at', 'INTEGER NOT NULL DEFAULT 0'],
+  ]);
+  // Default gear per Ambit sport type (e.g. "Cycling" -> a bike's local id). Auto-assign source.
+  await db.executeSql(`
+    CREATE TABLE IF NOT EXISTS gear_assignment (
+      activity_type TEXT    PRIMARY KEY,
+      gear_id       TEXT    NOT NULL
+    )
+  `);
+  // The LOCAL gear-usage ledger: which gear each synced watch move is attributed to, plus its
+  // distance/time, so the app tallies gear mileage ITSELF (independence from intervals.icu — the
+  // aim is to ditch it). Displayed gear distance = imported baseline (gear.distance_m at last
+  // import) + sum of ledger entries recorded AFTER that import (assigned_at > gear.last_synced_at),
+  // which avoids double-counting anything intervals already had in its total.
+  await db.executeSql(`
+    CREATE TABLE IF NOT EXISTS activity_gear (
+      activity_id   TEXT    PRIMARY KEY,
+      gear_id       TEXT    NOT NULL,
+      distance_m    REAL    NOT NULL DEFAULT 0,
+      time_s        REAL    NOT NULL DEFAULT 0,
+      activity_date TEXT    NOT NULL DEFAULT '',
+      assigned_at   INTEGER NOT NULL DEFAULT 0
+    )
+  `);
+  await addMissingColumns(db, 'activity_gear', [
+    ['distance_m', 'REAL NOT NULL DEFAULT 0'],
+    ['time_s', 'REAL NOT NULL DEFAULT 0'],
+    ['activity_date', `TEXT NOT NULL DEFAULT ''`],
+  ]);
+  // Per-activity metrics read from its GPX (HR, calories, cadence...), cached so the Activities
+  // list parses each GPX once ever instead of on every visit (André, 2026-09-29: the list parsed
+  // every GPX before showing anything, ~110 s on the tablet). One column per sortable metric so a
+  // sort by any column runs in SQL; `json` keeps the whole GpxMetadata for the cards. Rows are
+  // keyed to the activity's synced_at: a re-import makes the cached row stale.
+  await db.executeSql(`
+    CREATE TABLE IF NOT EXISTS activity_metrics (
+      id           TEXT    PRIMARY KEY,
+      synced_at    INTEGER NOT NULL,
+      json         TEXT    NOT NULL,
+      descent      REAL, calories REAL, avgHr REAL, maxHr REAL, avgCadence REAL, maxCadence REAL,
+      avgSpeed     REAL, maxSpeed REAL, recovery REAL, peakTe REAL, maxAltitude REAL,
+      poolLengths  REAL, pace REAL
+    )
+  `);
+  // Shots (Traverse Alpha, Hunting), added 2026-11-13: an existing table gains the column.
+  await addMissingColumns(db, 'activity_metrics', [['shots', 'REAL']]);
+  return db;
+}
+
+// ─── Activities list, paged (André, 2026-09-29) ───────────────────────────────
+// "not worth to load all the 4XXX activities ... load it progressively ... I would say 30": the list
+// fetches ACTIVITY_PAGE rows at a time, filtered and sorted here in SQL, and asks for the next
+// page as the user nears the end. See LogListScreen.
+
+export const ACTIVITY_PAGE = 30;
+
+/** Metric columns cached in activity_metrics (the ones that only exist in a GPX). */
+export const GPX_METRIC_COLUMNS = ['descent', 'calories', 'avgHr', 'maxHr', 'avgCadence', 'maxCadence',
+  'avgSpeed', 'maxSpeed', 'recovery', 'peakTe', 'maxAltitude', 'poolLengths', 'pace', 'shots'] as const;
+
+export type ActivityPageRow = ActivityRecord & { metrics_json: string | null; metrics_synced_at: number | null };
+
+// ORDER BY expression per sort key. Core values come from the activities table; GPX-only ones
+// from the cache (0 when never read - those sort as "no value"). Pace/avg speed prefer the GPX
+// figure and fall back to distance/duration, like buildMetrics() does.
+function orderExpr(key: string): string {
+  switch (key) {
+    case 'uploaded': return 'a.synced_at';
+    case 'distance': return 'a.distance_m';
+    case 'duration': return 'a.duration_s';
+    case 'ascent':   return 'a.d_plus';
+    case 'pace':     return `COALESCE(NULLIF(m.pace, 0), CASE WHEN a.distance_m > 0 AND a.duration_s > 0
+                             THEN a.duration_s * 1000.0 / a.distance_m ELSE 0 END)`;
+    case 'avgSpeed': return `COALESCE(NULLIF(m.avgSpeed, 0), CASE WHEN a.distance_m > 0 AND a.duration_s > 0
+                             THEN a.distance_m * 3600.0 / a.duration_s ELSE 0 END)`;
+    case 'calories': return 'COALESCE(NULLIF(m.calories, 0), a.energy_kcal, 0)';
+    default:
+      return (GPX_METRIC_COLUMNS as readonly string[]).indexOf(key) >= 0 ? `COALESCE(m.${key}, 0)` : 'a.date';
+  }
+}
+
+/** One page of the activities list: sport filter ('' = all) and sort applied in SQL. */
+export async function getActivityPage(opts: { type: string; sortKey: string; desc: boolean; offset: number;
+                                              limit?: number }): Promise<ActivityPageRow[]> {
+  const db = await getDb();
+  const dir = opts.desc ? 'DESC' : 'ASC';
+  // a.id last: equal dates/upload times (bulk imports) must still come in ONE fixed order, or
+  // LIMIT/OFFSET pages overlap and a row shows twice (seen on the tablet, 2026-09-29).
+  const tie = (opts.sortKey === 'date' ? `a.synced_at ${dir}` : `a.date ${dir}, a.synced_at ${dir}`) + ', a.id';
+  const where = opts.type ? 'WHERE a.activity_type = ?' : '';
+  const args: (string | number)[] = opts.type ? [opts.type] : [];
+  const [res] = await db.executeSql(
+    `SELECT a.*, m.json AS metrics_json, m.synced_at AS metrics_synced_at
+       FROM activities a LEFT JOIN activity_metrics m ON m.id = a.id
+       ${where}
+      ORDER BY ${orderExpr(opts.sortKey)} ${dir}, ${tie}
+      LIMIT ? OFFSET ?`,
+    [...args, opts.limit ?? ACTIVITY_PAGE, opts.offset]);
+  const out: ActivityPageRow[] = [];
+  for (let i = 0; i < res.rows.length; i++) {
+    const a = res.rows.item(i);
+    a.gpx_path = rebaseToDocuments(a.gpx_path);
+    out.push(a);
+  }
+  return out;
+}
+
+/** The sport types present, for the list's filter chips (without loading every row). */
+export async function getActivityTypes(): Promise<string[]> {
+  const db = await getDb();
+  const [res] = await db.executeSql(
+    `SELECT DISTINCT activity_type FROM activities WHERE activity_type != '' ORDER BY activity_type`);
+  const out: string[] = [];
+  for (let i = 0; i < res.rows.length; i++) out.push(res.rows.item(i).activity_type);
+  return out;
+}
+
+/** Caches one activity's GPX-derived metrics (values keyed as GPX_METRIC_COLUMNS). */
+export async function saveActivityMetrics(id: string, syncedAt: number, json: string,
+                                          values: Record<string, number>): Promise<void> {
+  const db = await getDb();
+  const cols = GPX_METRIC_COLUMNS as readonly string[];
+  await db.executeSql(
+    `INSERT OR REPLACE INTO activity_metrics (id, synced_at, json, ${cols.join(', ')})
+     VALUES (?, ?, ?, ${cols.map(() => '?').join(', ')})`,
+    [id, syncedAt, json, ...cols.map(c => values[c] || 0)]);
+}
+
+/** Activities with a GPX whose metrics were never cached (or are stale) - for a one-off fill
+ *  before sorting by a GPX-only column. */
+export async function getActivitiesMissingMetrics(): Promise<ActivityRecord[]> {
+  const db = await getDb();
+  const [res] = await db.executeSql(
+    `SELECT a.* FROM activities a LEFT JOIN activity_metrics m ON m.id = a.id
+      WHERE a.gpx_path != '' AND (m.id IS NULL OR m.synced_at != a.synced_at)`);
+  const out: ActivityRecord[] = [];
+  for (let i = 0; i < res.rows.length; i++) {
+    const a = res.rows.item(i);
+    a.gpx_path = rebaseToDocuments(a.gpx_path);
+    out.push(a);
+  }
+  return out;
+}
+
+// ─── API publique ─────────────────────────────────────────────────────────────
+
+/** Vérifie si un log a déjà été synchronisé ET n'est pas dans la liste noire. */
+export async function isActivitySynced(id: string): Promise<boolean> {
+  const db = await getDb();
+  const [[synced], [deleted]] = await Promise.all([
+    db.executeSql('SELECT 1 FROM activities WHERE id = ? LIMIT 1', [id]),
+    db.executeSql('SELECT 1 FROM deleted_activities WHERE id = ? LIMIT 1', [id]),
+  ]);
+  return synced.rows.length > 0 || deleted.rows.length > 0;
+}
+
+/** Vérifie si un ID est dans la liste noire (supprimé volontairement). */
+export async function isActivityDeleted(id: string): Promise<boolean> {
+  const db = await getDb();
+  const [result] = await db.executeSql(
+    'SELECT 1 FROM deleted_activities WHERE id = ? LIMIT 1', [id]
+  );
+  return result.rows.length > 0;
+}
+
+// Tidy-up of what earlier builds stored (André, 2026-10-03). Runs at every open and is a no-op
+// once done:
+//   * junk/test entries (SportNames.isJunkActivity) are removed; the desktop has skipped
+//     them at import since 2026-08-24 ("it was tests for our app"), Android never did;
+//   * sport types stored raw ("EMountainBikeRide"), under an old spelling or with stray spaces
+//     get Suunto's name (SportNames.canonicalSportName).
+async function tidyImportedActivities(db: SQLiteDatabase): Promise<void> {
+  // Blacklisted, not just deleted: a watch move's GPX is still on disk and the watch still has
+  // it, so a plain delete came straight back at the next orphan scan / watch read (seen on the
+  // tablet, 2026-10-03). deleted_activities is what every import path already honours. No
+  // Sommet Sync tombstone - this is a local view rule, not a delete to push to other devices.
+  if (HIDE_SHORT_TEST_ACTIVITIES) {
+    await db.executeSql(
+      `INSERT OR IGNORE INTO deleted_activities (id, deleted_at)
+         SELECT id, ? FROM activities WHERE duration_s < ${JUNK_MAX_S} AND distance_m < ${JUNK_MAX_M}`, [Date.now()]);
+    await db.executeSql(`DELETE FROM activities WHERE duration_s < ${JUNK_MAX_S} AND distance_m < ${JUNK_MAX_M}`);
+  }
+  // Copies of intervals.icu moves made from their own track files (tablet audit F21,
+  // 2026-10-31): an "icu:<n>" move keeps its track as "icu_<n>.gpx", and the orphan-file scan
+  // took each such file for a lost move (OrphanGpx.ts). Only the copy goes: the real row keeps
+  // the file, and nothing else (gear, metrics, tombstones) points at the copies.
+  await db.executeSql(
+    `DELETE FROM activities WHERE id LIKE 'icu\\_%' ESCAPE '\\'
+       AND EXISTS (SELECT 1 FROM activities AS kept WHERE kept.id = 'icu:' || substr(activities.id, 5))`);
+  const [res] = await db.executeSql(`SELECT DISTINCT activity_type FROM activities WHERE activity_type != ''`);
+  for (let i = 0; i < res.rows.length; i++) {
+    const from: string = res.rows.item(i).activity_type;
+    const to = canonicalSportName(from);
+    if (to && to !== from)
+      await db.executeSql('UPDATE activities SET activity_type = ? WHERE activity_type = ?', [to, from]);
+  }
+}
+
+/**
+ * True (and the id is blacklisted so it is never offered again) when a move about to be stored is
+ * a junk/test entry - under a minute AND under 100 m. For the import paths that read the watch
+ * or adopt a GPX file.
+ */
+export async function rejectJunkActivity(id: string, durationS: number, distanceM: number): Promise<boolean> {
+  if (!isJunkActivity(durationS, distanceM)) return false;
+  const db = await getDb();
+  await db.executeSql('INSERT OR IGNORE INTO deleted_activities (id, deleted_at) VALUES (?, ?)', [id, Date.now()]);
+  return true;
+}
+
+/** Removes an imported copy of a move this device already has from the watch, and blacklists
+ *  its id so the next import does not bring it back. Local only (no Sommet Sync tombstone). */
+export async function rejectDuplicateImport(id: string): Promise<void> {
+  const db = await getDb();
+  await db.executeSql('INSERT OR IGNORE INTO deleted_activities (id, deleted_at) VALUES (?, ?)', [id, Date.now()]);
+  await db.executeSql('DELETE FROM activities WHERE id = ?', [id]);
+}
+
+/** Removes an imported activity that no longer exists at its source. No blacklist entry: if it
+ *  ever exists there again, it may come back. */
+export async function removeImportedActivity(id: string): Promise<void> {
+  const db = await getDb();
+  await db.executeSql('DELETE FROM activities WHERE id = ?', [id]);
+}
+
+/** What a later intervals.icu import may correct on a row it already has: sport name, calories. */
+export async function updateImportedActivity(id: string, fields: { activity_type?: string; energy_kcal?: number; start_utc?: number; moving_s?: number }): Promise<void> {
+  const db = await getDb();
+  if (fields.activity_type !== undefined)
+    await db.executeSql('UPDATE activities SET activity_type = ? WHERE id = ?', [fields.activity_type, id]);
+  if (fields.energy_kcal !== undefined)
+    await db.executeSql('UPDATE activities SET energy_kcal = ? WHERE id = ?', [fields.energy_kcal, id]);
+  if (fields.start_utc !== undefined)   // updated_at moves so the shared database passes it on
+    await db.executeSql('UPDATE activities SET start_utc = ?, updated_at = ? WHERE id = ?', [fields.start_utc, Date.now(), id]);
+  if (fields.moving_s !== undefined)    // sync/06: moving time arriving for a row that lacked it
+    await db.executeSql('UPDATE activities SET moving_s = ? WHERE id = ? AND moving_s = 0', [fields.moving_s, id]);
+}
+
+/** sync/06: rows whose moving time hasn't been read from their FIT yet (moving_s 0). */
+export async function activitiesWithoutMovingTime(limit: number): Promise<{ id: string; gpx_path: string }[]> {
+  const db = await getDb();
+  const [r] = await db.executeSql(
+    "SELECT id, gpx_path FROM activities WHERE moving_s = 0 AND gpx_path <> '' LIMIT ?", [limit]);
+  const out: { id: string; gpx_path: string }[] = [];
+  for (let i = 0; i < r.rows.length; i++) out.push({ id: r.rows.item(i).id, gpx_path: r.rows.item(i).gpx_path });
+  return out;
+}
+
+/** sync/06: store a moving time read from the FIT; updated_at moves so Sommet Sync passes it on.
+ *  -1 = looked, the file has none (never sent, read as unknown). */
+export async function setMovingTime(id: string, movingS: number): Promise<void> {
+  const db = await getDb();
+  if (movingS > 0)
+    await db.executeSql('UPDATE activities SET moving_s = ?, updated_at = ? WHERE id = ?', [movingS, Date.now(), id]);
+  else
+    await db.executeSql('UPDATE activities SET moving_s = -1 WHERE id = ?', [id]);
+}
+
+/** Enregistre une activité synchronisée dans la base. */
+export async function markActivitySynced(record: ActivityRecord): Promise<void> {
+  const db = await getDb();
+  await db.executeSql(
+    `INSERT OR REPLACE INTO activities
+       (id, synced_at, gpx_path, date, duration_s, distance_m, d_plus, activity_type, device, updated_at,
+        energy_kcal, start_utc, moving_s, track_remote, track_cached_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+             COALESCE(?, (SELECT track_remote FROM activities WHERE id = ?), 0),
+             COALESCE(?, (SELECT track_cached_at FROM activities WHERE id = ?), 0))`,
+    [
+      record.id,
+      record.synced_at,
+      record.gpx_path,
+      record.date,
+      record.duration_s,
+      record.distance_m,
+      record.d_plus,
+      record.activity_type,
+      record.device ?? '',
+      record.updated_at ?? record.synced_at,
+      Math.round(record.energy_kcal ?? 0) || 0,
+      Math.round(record.start_utc ?? 0) || 0,
+      Math.round(record.moving_s ?? 0) || 0,
+      // Light library: a caller that doesn't say keeps what the row had (INSERT OR REPLACE would
+      // otherwise reset them and forget that the Track is on the server).
+      record.track_remote ?? null, record.id,
+      record.track_cached_at ?? null, record.id,
+    ]
+  );
+}
+
+// ─── Sommet Sync (#SYNC-3) DB helpers ───────────────────────────────────────────
+
+/** The cross-device identity of a move: device|start-minute (matches desktop's sommetUid). */
+export function sommetUid(device: string, date: string): string {
+  return `${device ?? ''}|${(date ?? '').slice(0, 16)}`;
+}
+
+/** uid-tombstones (device|start-minute) held for Sommet Sync, mirroring desktop's sommet_deleted. */
+export async function getSommetTombstones(): Promise<string[]> {
+  const db = await getDb();
+  const [r] = await db.executeSql('SELECT uid FROM sommet_deleted');
+  const out: string[] = [];
+  for (let i = 0; i < r.rows.length; i++) out.push(r.rows.item(i).uid);
+  return out;
+}
+
+export async function addSommetTombstone(uid: string): Promise<void> {
+  const db = await getDb();
+  await db.executeSql('INSERT OR IGNORE INTO sommet_deleted (uid) VALUES (?)', [uid]);
+}
+
+/** Sync ledger: uid -> the updated_at the server holds for it. */
+export async function getSommetLedger(): Promise<Map<string, number>> {
+  const db = await getDb();
+  const [r] = await db.executeSql('SELECT uid, sent_updated_at FROM sommet_ledger');
+  const out = new Map<string, number>();
+  for (let i = 0; i < r.rows.length; i++) {
+    const row = r.rows.item(i);
+    out.set(row.uid, Number(row.sent_updated_at));
+  }
+  return out;
+}
+
+/** Record that the server holds these versions (after it accepted them, or they came from it). */
+export async function markSommetSent(entries: { uid: string; updatedAt: number }[]): Promise<void> {
+  if (entries.length === 0) return;
+  const db = await getDb();
+  for (let i = 0; i < entries.length; i += 200) {
+    const part = entries.slice(i, i + 200);
+    await db.executeSql(
+      'INSERT OR REPLACE INTO sommet_ledger (uid, sent_updated_at) VALUES '
+        + part.map(() => '(?, ?)').join(', '),
+      part.flatMap(e => [e.uid, e.updatedAt]));
+  }
+}
+
+/** Tombstones the server already has (sent from here, or pulled from it). */
+export async function getSommetDeletedSent(): Promise<Set<string>> {
+  const db = await getDb();
+  const [r] = await db.executeSql('SELECT uid FROM sommet_deleted_sent');
+  const out = new Set<string>();
+  for (let i = 0; i < r.rows.length; i++) out.add(r.rows.item(i).uid);
+  return out;
+}
+
+export async function markSommetDeletedSent(uids: string[]): Promise<void> {
+  if (uids.length === 0) return;
+  const db = await getDb();
+  for (let i = 0; i < uids.length; i += 400) {
+    const part = uids.slice(i, i + 400);
+    await db.executeSql(
+      'INSERT OR IGNORE INTO sommet_deleted_sent (uid) VALUES ' + part.map(() => '(?)').join(', '), part);
+  }
+}
+
+/** Delete every local row matching a uid (device|start-minute). Used when a remote tombstone
+ *  arrives. Compares the first 16 chars of `date` (tolerant of the …Z/ms vs no-Z formats). */
+export async function deleteActivitiesByUid(uid: string): Promise<void> {
+  const bar = uid.indexOf('|');
+  if (bar < 0) return;
+  const device = uid.slice(0, bar);
+  const minute = uid.slice(bar + 1);
+  const db = await getDb();
+  await db.executeSql(
+    'DELETE FROM activities WHERE device = ? AND substr(date,1,16) = ?', [device, minute]
+  );
+}
+
+/** The local row (updated_at + gpx_path) for a uid, or null if we don't have it. */
+export async function getActivityByUid(
+  uid: string
+): Promise<{ id: string; updated_at: number; gpx_path: string; energy_kcal: number; activity_type: string; start_utc: number; moving_s: number; track_remote: number } | null> {
+  const bar = uid.indexOf('|');
+  if (bar < 0) return null;
+  const device = uid.slice(0, bar);
+  const minute = uid.slice(bar + 1);
+  const db = await getDb();
+  const [r] = await db.executeSql(
+    'SELECT id, updated_at, gpx_path, energy_kcal, activity_type, start_utc, moving_s, track_remote FROM activities WHERE device = ? AND substr(date,1,16) = ? LIMIT 1',
+    [device, minute]
+  );
+  if (r.rows.length === 0) return null;
+  const row = r.rows.item(0);
+  return { id: row.id, updated_at: Number(row.updated_at || 0), gpx_path: row.gpx_path,
+    energy_kcal: Number(row.energy_kcal || 0), activity_type: String(row.activity_type || ''), start_utc: Number(row.start_utc || 0),
+    moving_s: Number(row.moving_s || 0), track_remote: Number(row.track_remote || 0) };
+}
+
+export type HomeActivity = Pick<ActivityRecord, 'date' | 'activity_type' | 'duration_s' | 'distance_m' | 'd_plus'>;
+
+export async function getHomeActivities(): Promise<HomeActivity[]> {
+  const db = await getDb();
+  const [result] = await db.executeSql(
+    'SELECT date, activity_type, duration_s, distance_m, d_plus FROM activities ORDER BY date DESC'
+  );
+  const activities: HomeActivity[] = [];
+  for (let i = 0; i < result.rows.length; i++) activities.push(result.rows.item(i));
+  return activities;
+}
+
+/** Retourne toutes les activités triées par date décroissante. */
+export async function getAllActivities(): Promise<ActivityRecord[]> {
+  const db = await getDb();
+  const [result] = await db.executeSql(
+    'SELECT * FROM activities ORDER BY date DESC'
+  );
+  const activities: ActivityRecord[] = [];
+  for (let i = 0; i < result.rows.length; i++) {
+    const a = result.rows.item(i);
+    a.gpx_path = rebaseToDocuments(a.gpx_path);   // survive an iOS container-UUID change
+    activities.push(a);
+  }
+  return activities;
+}
+
+/** Retourne tous les IDs connus (synchro + liste noire) pour éviter re-import. */
+export async function getAllSyncedIds(): Promise<string[]> {
+  const db = await getDb();
+  const [[synced], [deleted]] = await Promise.all([
+    db.executeSql('SELECT id FROM activities'),
+    db.executeSql('SELECT id FROM deleted_activities'),
+  ]);
+  const ids: string[] = [];
+  for (let i = 0; i < synced.rows.length; i++) ids.push(synced.rows.item(i).id);
+  for (let i = 0; i < deleted.rows.length; i++) ids.push(deleted.rows.item(i).id);
+  return ids;
+}
+
+/** Just the user-deleted blacklist IDs — used by a forced re-download (runSync forceRefresh) so
+ * kept activities are re-read from the watch while deleted ones are still never resurrected. */
+export async function getDeletedIds(): Promise<string[]> {
+  const db = await getDb();
+  const [result] = await db.executeSql('SELECT id FROM deleted_activities');
+  const ids: string[] = [];
+  for (let i = 0; i < result.rows.length; i++) ids.push(result.rows.item(i).id);
+  return ids;
+}
+
+/** Empties the deleted-activities blacklist — used by a "re-download incl. deleted" so a move
+ * removed by mistake can come back from the watch on the next sync. */
+export async function clearDeletedActivities(): Promise<void> {
+  const db = await getDb();
+  await db.executeSql('DELETE FROM deleted_activities');
+}
+
+/** Met à jour uniquement le type d'activité d'un enregistrement existant. */
+export async function updateActivityType(id: string, activityType: string): Promise<void> {
+  const db = await getDb();
+  await db.executeSql(
+    'UPDATE activities SET activity_type = ? WHERE id = ?',
+    [activityType, id]
+  );
+}
+
+/** Supprime une activité de la base et l'ajoute à la liste noire pour ne pas la re-importer. */
+export async function deleteActivity(id: string): Promise<void> {
+  const db = await getDb();
+  // Sommet Sync (#SYNC-3): before removing the row, capture its uid (device|start-minute) so the
+  // delete can propagate to the shared store and stay gone across a watch re-read. Rows deleted
+  // before this feature (no device recorded) yield an empty-device uid, still fine locally.
+  let uid: string | null = null;
+  const [pre] = await db.executeSql(
+    'SELECT device, date FROM activities WHERE id = ? LIMIT 1', [id]
+  );
+  if (pre.rows.length > 0) {
+    const row = pre.rows.item(0);
+    uid = sommetUid(row.device ?? '', row.date ?? '');
+  }
+  await db.executeSql('DELETE FROM activities WHERE id = ?', [id]);
+  await db.executeSql(
+    'INSERT OR IGNORE INTO deleted_activities (id, deleted_at) VALUES (?, ?)',
+    [id, Date.now()]
+  );
+  if (uid) await db.executeSql('INSERT OR IGNORE INTO sommet_deleted (uid) VALUES (?)', [uid]);
+}
+
+// ─── Light library (sync/13) ──────────────────────────────────────────────────
+
+/** One move by its local id, or null. */
+export async function getActivityById(id: string): Promise<ActivityRecord | null> {
+  const db = await getDb();
+  const [r] = await db.executeSql('SELECT * FROM activities WHERE id = ? LIMIT 1', [id]);
+  if (r.rows.length === 0) return null;
+  const a = r.rows.item(0);
+  a.gpx_path = rebaseToDocuments(a.gpx_path);
+  return a;
+}
+
+/** The move's Track now lives on the server only: the local file is gone (trimmed), or it was
+ *  never fetched (an older pulled move). The list still shows it as a move with a map. */
+export async function setTrackRemote(id: string): Promise<void> {
+  const db = await getDb();
+  await db.executeSql(
+    "UPDATE activities SET gpx_path = '', track_remote = 1, track_cached_at = 0 WHERE id = ?", [id]);
+}
+
+/** Many moves at once whose Track was never here but can be asked for (older intervals.icu imports). */
+export async function markTracksRemote(ids: string[]): Promise<void> {
+  if (ids.length === 0) return;
+  const db = await getDb();
+  for (let i = 0; i < ids.length; i += 400) {
+    const part = ids.slice(i, i + 400);
+    await db.executeSql(
+      `UPDATE activities SET track_remote = 1 WHERE gpx_path = '' AND id IN (${part.map(() => '?').join(', ')})`, part);
+  }
+}
+
+/** A fetched Track was written to `gpxPath`. cachedAt > 0: an opened older move, counted against
+ *  the size limit; 0: kept for good ("Everything"). Leaves synced_at alone, so the list's cached
+ *  figures stay valid. */
+export async function setTrackLocal(id: string, gpxPath: string, cachedAt: number): Promise<void> {
+  const db = await getDb();
+  await db.executeSql('UPDATE activities SET gpx_path = ?, track_cached_at = ? WHERE id = ?', [gpxPath, cachedAt, id]);
+}
+
+/** Nowhere has this move's Track after all: stop showing it as a move with a map. */
+export async function clearTrackRemote(id: string): Promise<void> {
+  const db = await getDb();
+  await db.executeSql('UPDATE activities SET track_remote = 0 WHERE id = ?', [id]);
+}
+
+/** Opened older moves whose Track was fetched back, oldest fetch first. */
+export async function getCachedTracks(): Promise<{ id: string; gpx_path: string; track_cached_at: number }[]> {
+  const db = await getDb();
+  const [r] = await db.executeSql(
+    "SELECT id, gpx_path, track_cached_at FROM activities WHERE track_cached_at > 0 AND gpx_path <> '' ORDER BY track_cached_at ASC");
+  const out: { id: string; gpx_path: string; track_cached_at: number }[] = [];
+  for (let i = 0; i < r.rows.length; i++) {
+    const a = r.rows.item(i);
+    out.push({ id: a.id, gpx_path: rebaseToDocuments(a.gpx_path), track_cached_at: Number(a.track_cached_at) });
+  }
+  return out;
+}
