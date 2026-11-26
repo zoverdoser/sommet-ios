@@ -53,7 +53,7 @@ export function tileUrl(provider: MapProvider, z: number, x: number, y: number):
 // same formula every slippy map uses"; IGN's WMTS TILEMATRIXSET=PM is the same
 // Pseudo-Mercator XYZ scheme, see MapHtml.ts).
 export function worldPixel(lat: number, lon: number, z: number): { x: number; y: number } {
-  const latRad = (lat * Math.PI) / 180;
+  const latRad = (Math.max(-85.05112878, Math.min(85.05112878, lat)) * Math.PI) / 180;
   const world = TILE_SIZE * 2 ** z;
   return {
     x: world * ((lon + 180) / 360),
@@ -190,7 +190,7 @@ export function fitBoundsMosaic(
   const p1 = worldPixel(maxLat, maxLon, z);
   const bboxW = Math.max(p1.x - p0.x, 1);
   const bboxH = Math.max(p0.y - p1.y, 1);
-  const center = worldPixel((minLat + maxLat) / 2, (minLon + maxLon) / 2, z);
+  const center = { x: (p0.x + p1.x) / 2, y: (p0.y + p1.y) / 2 };
 
   // The clamp itself: if nothing constrained the height (routes - see maxAutoHeight's own
   // comment above) and the real bbox aspect ratio would need more than maxAutoHeight at the

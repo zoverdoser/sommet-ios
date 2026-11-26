@@ -9,13 +9,11 @@ import { t } from '../i18n';
 import { MapView as PanZoomView, centredOn, layoutView, panView, viewFromMosaic, zoomView } from '../services/MapPanZoom';
 import { useScrollLock } from './ScrollLock';
 
-// Touch (André, 2026-11-21: "press and drag and for poi, double tap"). A quick swipe on the map
-// still scrolls the page; a finger held still for HOLD_MS grabs the map (a green frame shows
-// it), the page stops scrolling and the drag moves the map. Two fingers pinch-zoom. A
-// double-tap calls onDoubleTap with the point (the POI form puts the POI there).
+// Previews let a quick swipe scroll the page, and a hold grabs the map.
+// The POI map uses direct dragging and double-tap zoom.
 const HOLD_MS = 300;
 const SLOP = 10;
-const DOUBLE_TAP_MS = 300;
+const DOUBLE_TAP_MS = 400;
 
 // v3.0 UI port, revised 2026-08-10 ("apply the same fix as we did on the desktop, centering
 // the gpx for POIs and Routes on the maps. for routes allow the cards to have different
@@ -33,8 +31,8 @@ const DOUBLE_TAP_MS = 300;
 // pick a zoom/scale) renders on the next pass.
 export function TrackPreview({
   points, height = 100, markerOnly = false, variableHeight = false, multiMarker = false,
-  interactive = true, onDoubleTap, fallbackCenter, selectedIndex, onMarkerTap, focusOn,
-  draft, onDraftMove, draftGlyph, onlyPointZoom = 6, controls = false, centreRef,
+  interactive = true, panOnDrag = false, doubleTapZoom = false, fallbackCenter, selectedIndex, onMarkerTap, focusOn,
+  draft, onDraftMove, draftGlyph, onlyPointZoom = 6, controls = false,
   openAt, here, onShowAll, onShowHere, radius = 10, trackWidth = 3.5,
 }: {
   radius?: number;
@@ -57,8 +55,6 @@ export function TrackPreview({
   // With `controls`: the All button, and the button that goes back to `openAt`.
   onShowAll?: () => void;
   onShowHere?: () => void;
-  // Filled with a function giving the place at the middle of the map as it is now.
-  centreRef?: React.MutableRefObject<(() => { lat: number; lon: number }) | null>;
   // multiMarker only (the POIs screen's one map, André 2026-11-22): the marker at
   // `selectedIndex` (an index in `points`) is drawn filled and on top; a tap on a marker says
   // which one; `focusOn` moves the view to a point (a POI picked in the list) and, set back to
@@ -68,11 +64,12 @@ export function TrackPreview({
   onMarkerTap?: (index: number) => void;
   focusOn?: { lat: number; lon: number; key: number } | null;
   // No point yet (the POI form before a place is chosen): show the map here, without a pin.
-  fallbackCenter?: { lat: number; lon: number };
+  fallbackCenter?: { lat: number; lon: number; zoom?: number };
   // false: a fixed picture (activity cards, where a long-press already deletes the move).
   interactive?: boolean;
-  onDoubleTap?: (lat: number, lon: number) => void;
-  points: { lat: number; lon: number }[];
+  panOnDrag?: boolean;
+  doubleTapZoom?: boolean;
+  points: { lat: number; lon: number; name?: string }[];
   height?: number;
   markerOnly?: boolean;
   // Real, 2026-08-10 ("for routes allow the cards to have different height to allow gpx to
@@ -113,7 +110,8 @@ export function TrackPreview({
   const draftRef = useRef(draft);
   draftRef.current = draft;
   const pointsKey = points.map(p => `${p.lat},${p.lon}`).join(';');
-  useEffect(() => { viewRef.current = null; setView(null); }, [pointsKey]);   // new data: fit again
+  const openKey = openAt?.key ?? -1;
+  useEffect(() => { viewRef.current = null; setView(null); }, [pointsKey, openKey]);
   const setV = (v: PanZoomView) => { viewRef.current = v; setView(v); };
   // Where each marker is drawn now, with its index in `points`, for onMarkerTap.
   const markersRef = useRef<{ x: number; y: number; index: number }[]>([]);
@@ -126,12 +124,12 @@ export function TrackPreview({
     } else if (hadFocus.current) {
       hadFocus.current = false; viewRef.current = null; setView(null);   // every marker again
     }
-  }, [focusKey]);   // eslint-disable-line react-hooks/exhaustive-deps
-  const openKey = openAt ? openAt.key : -1;
-  useEffect(() => { viewRef.current = null; setView(null); }, [openKey]);   // eslint-disable-line react-hooks/exhaustive-deps
-  const zoomStep = (dz: number) => {
+  }, [focusKey, pointsKey, openKey]);   // eslint-disable-line react-hooks/exhaustive-deps
+  const zoomStep = (dz: number, anchor?: { x: number; y: number }) => {
     const v = viewRef.current ?? fittedRef.current;
-    if (v) setV(zoomView(v, v.zf, 2 ** dz));
+    if (!v) return;
+    const fromCentre = anchor && boxWidth ? { x: anchor.x - boxWidth / 2, y: anchor.y - height / 2 } : undefined;
+    setV(zoomView(v, v.zf, 2 ** dz, fromCentre));
   };
   const fitAgain = () => { viewRef.current = null; setView(null); hadFocus.current = false; };
   const release = () => {
@@ -140,9 +138,12 @@ export function TrackPreview({
     if (g.locked) { g.locked = false; scrollLock.unlock(); }
     setGrabbed(false);
   };
+  const lockPage = () => {
+    if (!g.locked) { g.locked = true; scrollLock.lock(); }
+  };
   const grab = () => {
     g.armed = true;
-    if (!g.locked) { g.locked = true; scrollLock.lock(); }
+    lockPage();
     if (!viewRef.current && fittedRef.current) setV(fittedRef.current);
     setGrabbed(true);
   };
@@ -154,9 +155,15 @@ export function TrackPreview({
   const responder = useMemo(() => PanResponder.create({
     onStartShouldSetPanResponder: () => false,
     onMoveShouldSetPanResponder: () => g.armed,
-    onMoveShouldSetPanResponderCapture: () => g.armed,
+    onMoveShouldSetPanResponderCapture: (_e, gs) => g.armed
+      || (panOnDrag && g.locked && !g.onCtrl && Math.hypot(gs.dx, gs.dy) > SLOP),
     onPanResponderTerminationRequest: () => false,
-    onPanResponderGrant: (_e, gs) => { g.lastX = gs.moveX; g.lastY = gs.moveY; },
+    onPanResponderGrant: (_e, gs) => {
+      if (!g.armed) grab();
+      g.moved = true;
+      g.lastTapT = 0;
+      g.lastX = gs.moveX; g.lastY = gs.moveY;
+    },
     onPanResponderMove: (e, gs) => {
       if (g.onDraft) {
         // The pin's foot is under the finger's point; the map stays where it is.
@@ -177,20 +184,22 @@ export function TrackPreview({
     },
     onPanResponderRelease: () => release(),
     onPanResponderTerminate: () => release(),
-  }), []);   // eslint-disable-line react-hooks/exhaustive-deps
+  }), [panOnDrag]);   // eslint-disable-line react-hooks/exhaustive-deps
   const touchHandlers = interactive ? {
     onTouchStart: (e: GestureResponderEvent) => {
       if (g.onCtrl) return;                          // a finger on + / - / All is not on the map
       const ts = e.nativeEvent.touches;
-      if (ts.length >= 2) { g.onDraft = false; grab(); return; }
-      g.x0 = e.nativeEvent.pageX; g.y0 = e.nativeEvent.pageY; g.t0 = Date.now(); g.moved = false;
+      if (ts.length >= 2) { g.onDraft = false; g.lastTapT = 0; grab(); return; }
+      g.x0 = e.nativeEvent.pageX; g.y0 = e.nativeEvent.pageY; g.t0 = e.nativeEvent.timestamp; g.moved = false;
       const dr = draftRef.current, lay = layoutRef.current;
       if (dr && lay) {
         const at = lay.project(dr.lat, dr.lon);
         if (Math.hypot(at.x - e.nativeEvent.locationX, at.y - e.nativeEvent.locationY) < 34) {
-          g.onDraft = true; grab(); return;          // no hold needed: the pin is what is dragged
+          g.onDraft = true;
+          if (!panOnDrag) { grab(); return; }
         }
       }
+      if (panOnDrag) { lockPage(); return; }
       if (g.timer) clearTimeout(g.timer);
       g.timer = setTimeout(() => { g.timer = null; if (!g.moved) grab(); }, HOLD_MS);
     },
@@ -205,27 +214,29 @@ export function TrackPreview({
       if (e.nativeEvent.touches.length > 0) return;
       if (g.onCtrl) { g.onCtrl = false; return; }
       const wasArmed = g.armed;
-      const quickTap = !g.moved && Date.now() - g.t0 < HOLD_MS;
+      const { timestamp, locationX: x, locationY: y } = e.nativeEvent;
+      const quickTap = !g.moved && timestamp - g.t0 < HOLD_MS;
       release();
-      if (!wasArmed && quickTap && onMarkerTap) {
+      if (wasArmed || !quickTap) { g.lastTapT = 0; return; }
+      if (doubleTapZoom) {
+        if (g.lastTapT && g.t0 - g.lastTapT < DOUBLE_TAP_MS && Math.hypot(x - g.lastTapX, y - g.lastTapY) < 40) {
+          g.lastTapT = 0;
+          zoomStep(1, { x, y });
+          return;
+        }
+        g.lastTapT = timestamp; g.lastTapX = x; g.lastTapY = y;
+      }
+      if (onMarkerTap) {
         // The nearest marker under the finger (within a fingertip, 30 px).
-        const x = e.nativeEvent.locationX, y = e.nativeEvent.locationY;
         let best = -1, bestD = 30;
         for (const m of markersRef.current) {
           const d = Math.hypot(m.x - x, m.y - y);
           if (d < bestD) { bestD = d; best = m.index; }
         }
-        if (best >= 0) { onMarkerTap(best); return; }
+        if (best >= 0) onMarkerTap(best);
       }
-      if (wasArmed || !quickTap || !onDoubleTap) return;
-      const now = Date.now(), x = e.nativeEvent.locationX, y = e.nativeEvent.locationY;
-      if (now - g.lastTapT < DOUBLE_TAP_MS && Math.hypot(x - g.lastTapX, y - g.lastTapY) < 40) {
-        g.lastTapT = 0;
-        const at = layoutRef.current ? layoutRef.current.latLonAt(x, y) : null;
-        if (at) onDoubleTap(at.lat, at.lon);
-      } else { g.lastTapT = now; g.lastTapX = x; g.lastTapY = y; }
     },
-    onTouchCancel: () => { g.onCtrl = false; release(); },
+    onTouchCancel: () => { g.onCtrl = false; g.lastTapT = 0; release(); },
   } : {};
 
   // Real bug, found live (2026-08-10) - some real synced activities carry a garbage GPS fix
@@ -244,6 +255,7 @@ export function TrackPreview({
   const hasMultiMarker = multiMarker && validPoints.length >= 1;
   const hasMultiPoint = !markerOnly && !multiMarker && validPoints.length >= 2;
   const hasSinglePoint = !multiMarker && (markerOnly || validPoints.length === 1) && validPoints.length >= 1;
+  const hasLabels = hasMultiMarker && validPoints.some(p => p.name);
 
   // Real, 2026-08-10 ("for data without gps data, please do a nice mappyish image saying no
   // data, soft color to not hurt the rest") - was a flat, empty box; a real placeholder now,
@@ -280,18 +292,20 @@ export function TrackPreview({
   const mosaic: TileMosaic = openAt
     ? centeredPointMosaic(openAt.lat, openAt.lon, boxWidth, height, openAt.zoom)
     : centerOnly
-    ? centeredPointMosaic(fallbackCenter!.lat, fallbackCenter!.lon, boxWidth, height, 13)
+    ? centeredPointMosaic(fallbackCenter!.lat, fallbackCenter!.lon, boxWidth, height, fallbackCenter!.zoom ?? 13)
     : hasSinglePoint
     ? centeredPointMosaic(validPoints[0].lat, validPoints[0].lon, boxWidth, height, 15)
     : hasMultiMarker && validPoints.length === 1
     ? centeredPointMosaic(validPoints[0].lat, validPoints[0].lon, boxWidth, height, onlyPointZoom)
-    : fitBoundsMosaic(validPoints, boxWidth, variableHeight ? {} : { targetHeight: height });
+    : fitBoundsMosaic(validPoints, boxWidth, {
+        targetHeight: variableHeight ? undefined : height,
+        ...(hasLabels ? { padding: 54, maxZoom: 16 } : {}),
+      });
 
   fittedRef.current = viewFromMosaic(mosaic);
   // Once grabbed, the owner's view; before that, the fitted picture (the same view, to the pixel).
   const lay = layoutView(view ?? fittedRef.current, mosaic.contentWidth, mosaic.contentHeight);
   layoutRef.current = lay;
-  if (centreRef) centreRef.current = () => lay.latLonAt(mosaic.contentWidth / 2, mosaic.contentHeight / 2);
   const drawn = view ? { z: lay.z, tiles: lay.tiles, project: lay.project } : mosaic;
   const projected = validPoints.map(p => drawn.project(p.lat, p.lon));
   markersRef.current = multiMarker ? projected.map((p, i) => ({ x: p.x, y: p.y, index: validIndex[i] })) : [];
@@ -366,6 +380,15 @@ export function TrackPreview({
           </>
         )}
       </Svg>
+      {hasLabels && projected.map((p, i) => {
+        const name = validPoints[i].name;
+        if (!name) return null;
+        return (
+          <View key={validIndex[i]} style={[styles.markerLabelPosition, { left: p.x - 52, top: p.y + 12 }]}>
+            <Text style={styles.markerLabel} numberOfLines={2}>{name}</Text>
+          </View>
+        );
+      })}
       {draftAt && !!draftGlyph && (
         <Text style={[styles.draftGlyph, { left: draftAt.x - 15, top: draftAt.y - 11 }]}>{draftGlyph}</Text>
       )}
@@ -373,17 +396,19 @@ export function TrackPreview({
       </View>
       {controls && (
         <View style={styles.controls} onTouchStart={() => { g.onCtrl = true; }}>
-          <TouchableOpacity style={styles.ctrl} onPress={() => zoomStep(1)} accessibilityLabel="Zoom in">
+          <TouchableOpacity style={styles.ctrl} onPress={() => zoomStep(1)} accessibilityRole="button" accessibilityLabel="Zoom in">
             <Text style={styles.ctrlText}>+</Text>
           </TouchableOpacity>
-          <TouchableOpacity style={styles.ctrl} onPress={() => zoomStep(-1)} accessibilityLabel="Zoom out">
+          <TouchableOpacity style={styles.ctrl} onPress={() => zoomStep(-1)} accessibilityRole="button" accessibilityLabel="Zoom out">
             <Text style={styles.ctrlText}>−</Text>
           </TouchableOpacity>
-          <TouchableOpacity style={styles.ctrl} onPress={() => { fitAgain(); onShowAll?.(); }} accessibilityLabel="Show all POIs">
+          <TouchableOpacity style={styles.ctrl} onPress={() => { fitAgain(); onShowAll?.(); }}
+            accessibilityRole="button" accessibilityLabel="Show all POIs">
             <Text style={styles.ctrlAll}>All</Text>
           </TouchableOpacity>
           {onShowHere && (
-            <TouchableOpacity style={styles.ctrl} onPress={() => { fitAgain(); onShowHere(); }} accessibilityLabel="Go to where I am">
+            <TouchableOpacity style={styles.ctrl} onPress={() => { fitAgain(); onShowHere(); }}
+              accessibilityRole="button" accessibilityLabel="Go to where I am">
               {/* A target, drawn: the app's icon font holds only the glyphs it uses. */}
               <Svg width={20} height={20} viewBox="0 0 20 20">
                 <Circle cx={10} cy={10} r={5.5} fill="none" stroke="#333333" strokeWidth={2} />
@@ -410,6 +435,9 @@ const styles = StyleSheet.create({
   ctrl: { width: 34, height: 34, borderRadius: 4, backgroundColor: '#FFFFFFCC', alignItems: 'center', justifyContent: 'center' },
   ctrlText: { fontSize: 20, fontWeight: '700', color: '#333333', lineHeight: 24 },
   ctrlAll: { fontSize: 11, fontWeight: '700', color: '#333333' },
+  markerLabelPosition: { position: 'absolute', width: 104, alignItems: 'center' },
+  markerLabel: { color: '#17251F', backgroundColor: '#FFFFFFEB', borderRadius: 4, overflow: 'hidden',
+                 fontSize: 10, fontWeight: '600', paddingHorizontal: 4, paddingVertical: 1, textAlign: 'center' },
   draftGlyph: { position: 'absolute', width: 30, height: 22, textAlign: 'center', fontFamily: 'MaterialSymbolsRounded',
                 fontSize: 18, lineHeight: 22, color: '#ffffff' },
   noDataBox: { alignItems: 'center', justifyContent: 'center', gap: 6 },

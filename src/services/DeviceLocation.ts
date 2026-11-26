@@ -67,6 +67,7 @@ async function wifiPlace(): Promise<DevicePlace | null> {
 export const LIVE_SECONDS = 600;
 
 let askedThisRun = false;
+let pendingIosPlace: Promise<DevicePlace | null> | undefined;
 const listeners = new Set<(p: DevicePlace) => void>();
 
 /** Every position read, from whichever screen asked for it. */
@@ -76,7 +77,7 @@ export function onDevicePlace(f: (p: DevicePlace) => void): () => void {
 }
 
 async function read(timeoutMs: number): Promise<DevicePlace | null> {
-  wifiPlace().catch(() => null);                 // quick and rough, next to the GPS
+  if (Platform.OS === 'android') wifiPlace().catch(() => null);
   const place: DevicePlace | null = await NativeModules.DeviceLocation.current(timeoutMs);
   if (place) {
     AsyncStorage.setItem(LAST_KEY, JSON.stringify(place)).catch(() => {});
@@ -105,7 +106,12 @@ export async function rememberedPlace(): Promise<DevicePlace | null> {
 
 export async function currentPlace(timeoutMs = 60000): Promise<DevicePlace | null> {
   const native = NativeModules.DeviceLocation;
-  if (Platform.OS !== 'android' || !native) return null;
+  if (!native) return null;
+  if (Platform.OS === 'ios') {
+    pendingIosPlace ??= read(timeoutMs).finally(() => { pendingIosPlace = undefined; });
+    return pendingIosPlace;
+  }
+  if (Platform.OS !== 'android') return null;
   const permission = PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION;
   let allowed = await PermissionsAndroid.check(permission);
   if (!allowed && !askedThisRun) {

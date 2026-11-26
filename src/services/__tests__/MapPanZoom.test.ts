@@ -23,13 +23,35 @@ describe('MapPanZoom', () => {
     close(after.x - before.x, 30); close(after.y - before.y, -12);
   });
 
-  it('latLonAt is the inverse of project (double-tap puts the POI under the finger)', () => {
+  it('latLonAt is the inverse of project', () => {
     const lay = layoutView(viewFromMosaic(centeredPointMosaic(FARO.lat, FARO.lon, 400, 220, 15)), 400, 220);
     const at = lay.latLonAt(123, 45);
     const back = lay.project(at.lat, at.lon);
     close(back.x, 123, 0.01); close(back.y, 45, 0.01);
     const mid = lay.latLonAt(200, 110);
     close(mid.lat, FARO.lat, 1e-5); close(mid.lon, FARO.lon, 1e-5);
+  });
+
+  it('fits POIs across latitudes with room around the markers', () => {
+    const points = [{ lat: 85, lon: -22 }, { lat: -12, lon: 30 }];
+    const m = fitBoundsMosaic(points, 390, { targetHeight: 280, padding: 54 });
+    for (const point of points) {
+      const p = m.project(point.lat, point.lon);
+      expect(p.x).toBeGreaterThan(52);
+      expect(p.x).toBeLessThan(338);
+      expect(p.y).toBeGreaterThan(36);
+      expect(p.y).toBeLessThan(244);
+    }
+  });
+
+  it('double-tap zoom keeps the tapped location under the finger', () => {
+    const v = viewFromMosaic(centeredPointMosaic(FARO.lat, FARO.lon, 400, 220, 12));
+    const at = layoutView(v, 400, 220).latLonAt(100, 70);
+    const zoomed = zoomView(v, v.zf, 2, { x: -100, y: -40 });
+    const projected = layoutView(zoomed, 400, 220).project(at.lat, at.lon);
+    expect(zoomed.zf).toBe(13);
+    close(projected.x, 100);
+    close(projected.y, 70);
   });
 
   it('pinch doubles the scale per doubling of the finger spread, within limits', () => {

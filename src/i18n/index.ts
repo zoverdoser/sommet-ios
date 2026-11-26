@@ -501,6 +501,7 @@ const fr = {
 
   // SettingsScreen — Ajouter un POI
   poiSection:    'Ajouter un POI',
+  poiLocationUnavailable: 'Impossible de vous localiser. Autorisez Sommet à accéder à votre position, puis réessayez.',
   poiDesc:       "Envoie un point d'intérêt à la montre par câble, en préservant ceux déjà présents.",
   poiName:       'Nom',
   poiNamePlaceholder: 'ex : Sommet',
@@ -1471,6 +1472,7 @@ const en: typeof fr = {
 
   // SettingsScreen — Add POI
   poiSection:    'Add POI',
+  poiLocationUnavailable: 'Could not get your current location. Check Sommet’s location access and try again.',
   poiDesc:       'Sends a point of interest to the watch over cable, preserving any already there.',
   poiName:       'Name',
   poiNamePlaceholder: 'e.g. Summit',

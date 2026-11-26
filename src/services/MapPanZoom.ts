@@ -5,7 +5,7 @@ import { TILE_SIZE, TileMosaic, worldPixel, worldToLatLon } from './MapTile';
 
 export interface MapView { u: number; v: number; zf: number }
 
-export const MIN_ZOOM = 2;
+export const MIN_ZOOM = 0;
 export const MAX_ZOOM = 18;
 
 const clampZoom = (zf: number) => Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, zf));
@@ -64,7 +64,10 @@ export function panView(view: MapView, dx: number, dy: number): MapView {
   return { ...view, u: wrap01(view.u - dx / world), v: clamp01(view.v - dy / world) };
 }
 
-/** Pinch: the zoom the view had when the two fingers landed, times their spread ratio. */
-export function zoomView(view: MapView, startZoom: number, ratio: number): MapView {
-  return { ...view, zf: clampZoom(startZoom + Math.log2(Math.max(ratio, 1e-9))) };
+/** Zoom around the centre or keep an anchor (in pixels from the centre) in place. */
+export function zoomView(view: MapView, startZoom: number, ratio: number, anchor?: { x: number; y: number }): MapView {
+  const zoomed = { ...view, zf: clampZoom(startZoom + Math.log2(Math.max(ratio, 1e-9))) };
+  if (!anchor) return zoomed;
+  const scale = 2 ** (zoomed.zf - view.zf);
+  return panView(zoomed, anchor.x * (1 - scale), anchor.y * (1 - scale));
 }

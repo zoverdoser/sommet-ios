@@ -1,7 +1,7 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { View, Text, StyleSheet, Alert, ScrollView, TouchableOpacity, Pressable, TextInput, useWindowDimensions } from 'react-native';
 import { AdaptiveModal as Modal } from '../components/ui/AdaptiveModal';
-import { useFocusEffect, useRoute } from '@react-navigation/native';
+import { useFocusEffect, useNavigation, useRoute } from '@react-navigation/native';
 import {
   addPoiToWatch, AddPoiState, readOnWatchPois, getCachedPois, exportSinglePoiToGpx, pickAndParseWaypoints,
   WatchPoi, removePoisFromWatch, getCachedPoiWatchModel,
@@ -19,8 +19,10 @@ import { Card } from '../components/ui/Card';
 import { Button, Dropdown, FieldRow, StatusNote } from '../components/ui/primitives';
 import { TrackPreview } from '../components/TrackPreview';
 import { LockableScrollView } from '../components/ScrollLock';
-import { useWeatherLocation } from '../services/WeatherService';
-import { currentPlace, onDevicePlace, rememberedPlace, DevicePlace, LIVE_SECONDS } from '../services/DeviceLocation';
+import { currentPlace, DevicePlace } from '../services/DeviceLocation';
+
+const LOCATION_TIMEOUT_MS = 12000;
+const WORLD_VIEW = { lat: 0, lon: 0, zoom: 2 };
 
 // v3.0 UI port (2026-08-09, "re do... pois to match entirely desktop") - real structural
 // rebuild matching desktop's own PoisPage.qml: "Add a POI" gets a live pin preview, "Import
@@ -48,12 +50,16 @@ import { currentPlace, onDevicePlace, rememberedPlace, DevicePlace, LIVE_SECONDS
 //
 // One map and one list, as on the desktop (André, 2026-11-23: "integrate the idea of the map +
 // list but we take the map where we already have to add poi"). The map shows every POI of the
-// list and is where a new one is placed: a double-tap or + Add POI puts an orange pin that can
-// be dragged, and the form opens beside the map (above the list on a phone). A tap on a pin
+// list. Add POI places an orange pin at the device's location and opens the form. A tap on a pin
 // marks its line; a tap on a line goes to its pin and opens its actions.
-export default function PoiScreen({ watch, active = true }: { watch?: boolean; active?: boolean } = {}) {
+export default function PoiScreen({ watch, active = true, embedded = false }: {
+  watch?: boolean;
+  active?: boolean;
+  embedded?: boolean;
+} = {}) {
   const theme = useV3Theme();
   const styles = createStyles(theme);
+  const navigation = useNavigation();
   const params = useRoute<any>().params || {};
 
   const [poiName, setPoiName] = useState('');
@@ -135,42 +141,64 @@ export default function PoiScreen({ watch, active = true }: { watch?: boolean; a
   const [listW, setListW] = useState(0);
   const [picked, setPicked] = useState(-1);
   const [focus, setFocus] = useState<{ lat: number; lon: number; key: number } | null>(null);
+  const [draftFocus, setDraftFocus] = useState<typeof focus>(null);
   const paneRef = useRef<ScrollView>(null);
-  const mapCentre = useRef<(() => { lat: number; lon: number }) | null>(null);
-  // The map opens where the tablet is (André, 2026-11-23): its live position with a blue dot,
-  // else the last one it had, else the weather place. All shows every POI; the location button
-  // comes back here.
   const [here, setHere] = useState<DevicePlace | null>(null);
-  const [lastPlace, setLastPlace] = useState<DevicePlace | null>(null);
-  const [atHere, setAtHere] = useState(true);
-  const [hereKey, setHereKey] = useState(0);
+  const [hereKey, setHereKey] = useState<number | null>(null);
+  const [locating, setLocating] = useState(false);
+  const focusSession = useRef(0);
   useFocusEffect(useCallback(() => {
     if (!active) return;
-    let live = true;
-    rememberedPlace().then(p => { if (live && p) setLastPlace(p); });
-    // Wi-Fi answers first and roughly, the GPS later and finely: keep the finer one.
-    const off = onDevicePlace(p => {
-      if (live && p.ageSeconds < LIVE_SECONDS) setHere(prev => (!prev || p.accuracy <= prev.accuracy ? p : prev));
+    const session = ++focusSession.current;
+    currentPlace(LOCATION_TIMEOUT_MS).catch(() => null).then(place => {
+      if (focusSession.current === session) setHere(place);
     });
-    currentPlace().then(p => {
-      if (!live || !p) return;
-      if (p.ageSeconds >= LIVE_SECONDS) setLastPlace(p);
-    }).catch(() => {});
-    return () => { live = false; off(); };
+    return () => { focusSession.current++; };
   }, [active]));
   const rowY = useRef<Record<number, number>>({});
+  function showAll() {
+    setPicked(-1);
+    setFocus(null);
+    setDraftFocus(null);
+    setHereKey(null);
+  }
   function pickFromList(i: number, lat: number, lon: number) {
-    if (picked === i) { setPicked(-1); setFocus(null); setAtHere(false); return; }
+    if (picked === i) { showAll(); return; }
+    setDraftFocus(null);
+    setHereKey(null);
     setPicked(i); setFocus({ lat, lon, key: Date.now() });
   }
-  // Puts the new POI's pin at a place and opens the form (moves the pin if it is already open).
-  function placePin(lat: number, lon: number) {
+  const addAtCurrentLocation = useCallback(async () => {
+    if (locating || poiBusy) return;
+    const session = focusSession.current;
+    setLocating(true);
+    const place = await currentPlace(LOCATION_TIMEOUT_MS).catch(() => null);
+    setLocating(false);
+    if (focusSession.current !== session) return;
+    if (!place) {
+      Alert.alert(t.error, t.poiLocationUnavailable);
+      return;
+    }
     if (!adding) { setPoiName(''); setPoiType(poiTypeDefaultFor(watchModel)); }
-    setPoiLat(lat.toFixed(6)); setPoiLon(lon.toFixed(6));
+    setHere(place);
+    setPoiLat(place.lat.toFixed(6));
+    setPoiLon(place.lon.toFixed(6));
     setPicked(-1);
+    setFocus(null);
+    setHereKey(null);
+    setDraftFocus({ lat: place.lat, lon: place.lon, key: Date.now() });
     setAdding(true);
+  }, [adding, locating, poiBusy, watchModel]);
+  useLayoutEffect(() => {
+    if (!embedded || !active) return;
+    navigation.setOptions({
+      headerRight: () => <Button label={t.poiSection} variant="text" grow={false} busy={locating}
+        disabled={poiBusy} onPress={addAtCurrentLocation} />,
+    });
+  }, [active, addAtCurrentLocation, embedded, locating, navigation, poiBusy]);
+  function closeForm() {
+    setAdding(false); setPoiName(''); setPoiLat(''); setPoiLon(''); setDraftFocus(null);
   }
-  function closeForm() { setAdding(false); setPoiName(''); setPoiLat(''); setPoiLon(''); }
   function pickFromMap(i: number) {
     setPicked(i);
     paneRef.current?.scrollTo({ y: Math.max(0, (rowY.current[i] ?? 0) - 8), animated: true });
@@ -361,8 +389,8 @@ export default function PoiScreen({ watch, active = true }: { watch?: boolean; a
   const libShown = library.filter(p => !q || p.name.toLowerCase().includes(q));
   const watchShown = (watchHere && !onWatchLoading && onWatch ? onWatch : []).filter(p => !q || p.name.toLowerCase().includes(q));
   const sourceCount = source === 1 ? library.length : (watchHere && !onWatchLoading && onWatch ? onWatch.length : 0);
-  const mapPoints = source === 1 ? libShown.map(p => ({ lat: p.lat, lon: p.lon }))
-    : watchShown.map(p => ({ lat: p.latitude, lon: p.longitude }));
+  const mapPoints = source === 1 ? libShown.map(p => ({ lat: p.lat, lon: p.lon, name: p.name }))
+    : watchShown.map(p => ({ lat: p.latitude, lon: p.longitude, name: p.name }));
   const mapPointsKey = `${source}:${mapPoints.map(p => `${p.lat},${p.lon}`).join(';')}`;
   useEffect(() => {
     setFocus(null); rowY.current = {};
@@ -376,19 +404,17 @@ export default function PoiScreen({ watch, active = true }: { watch?: boolean; a
   }, [mapPointsKey]);   // eslint-disable-line react-hooks/exhaustive-deps
   const sideBySide = listW >= 600;
   const paneH = Math.max(320, Math.min(600, winH - 270));
-  const weather = useWeatherLocation();
   const addType = poiTypesFor(watchModel).find(pt => pt.id === poiType);
   const mapEl = (
     <View style={sideBySide ? { flex: 1.35 } : { marginHorizontal: -12 }}>
-      <TrackPreview points={mapPoints} radius={sideBySide ? 8 : 0} multiMarker controls onlyPointZoom={13} height={sideBySide ? paneH : 280}
-        fallbackCenter={{ lat: weather.latitude, lon: weather.longitude }}
-        openAt={atHere ? { lat: here?.lat ?? lastPlace?.lat ?? weather.latitude,
-                           lon: here?.lon ?? lastPlace?.lon ?? weather.longitude, zoom: 13, key: hereKey } : null}
+      <TrackPreview points={mapPoints} radius={sideBySide ? 8 : 0} multiMarker controls panOnDrag doubleTapZoom
+        onlyPointZoom={13} height={sideBySide ? paneH : 280}
+        fallbackCenter={here ?? WORLD_VIEW}
+        openAt={here && hereKey !== null ? { lat: here.lat, lon: here.lon, zoom: 13, key: hereKey } : null}
         here={here}
-        onShowAll={() => { setPicked(-1); setFocus(null); setAtHere(false); }}
-        onShowHere={() => { setPicked(-1); setFocus(null); setAtHere(true); setHereKey(k => k + 1); }}
-        selectedIndex={picked} onMarkerTap={pickFromMap} focusOn={focus} centreRef={mapCentre}
-        onDoubleTap={placePin}
+        onShowAll={showAll}
+        onShowHere={here ? () => { showAll(); setHereKey(Date.now()); } : undefined}
+        selectedIndex={picked} onMarkerTap={pickFromMap} focusOn={focus ?? draftFocus}
         draft={adding && hasValidCoords ? { lat: parsedLat, lon: parsedLon } : null}
         draftGlyph={addType?.glyph}
         onDraftMove={(lat, lon) => { setPoiLat(lat.toFixed(6)); setPoiLon(lon.toFixed(6)); }} />
@@ -415,7 +441,6 @@ export default function PoiScreen({ watch, active = true }: { watch?: boolean; a
       </Modal>
 
       <Card style={{ width: '100%' }}>
-        {/* One source at a time (desktop's drop-down); Import and + Add POI on the right. */}
         <View style={styles.bar}>
           <View style={{ flexDirection: 'row', alignItems: 'center', gap: 12, flexWrap: 'wrap', flexShrink: 1 }}>
             {watchHere
@@ -432,13 +457,10 @@ export default function PoiScreen({ watch, active = true }: { watch?: boolean; a
               </TouchableOpacity>
             )}
           </View>
-          <View style={{ flexDirection: 'row', gap: v3Spacing.small }}>
+          {!embedded && <View style={{ flexDirection: 'row', gap: v3Spacing.small }}>
             <Button label="Import GPX…" variant="outline" grow={false} loading={importPicking} disabled={importPicking} onPress={handleImportPick} />
-            <Button label="+ Add POI" accent grow={false} onPress={() => {
-              const c = mapCentre.current?.() ?? { lat: weather.latitude, lon: weather.longitude };
-              placePin(c.lat, c.lon);
-            }} />
-          </View>
+            <Button label={t.poiSection} accent grow={false} busy={locating} disabled={poiBusy} onPress={addAtCurrentLocation} />
+          </View>}
         </View>
         {note && <StatusNote text={note.text} tone={note.tone} closable />}
 
@@ -484,14 +506,13 @@ export default function PoiScreen({ watch, active = true }: { watch?: boolean; a
               </View>
             </View>
           )}
-          {!adding && <Text style={styles.itemStats}>Double-tap the map to add a POI. Hold the map still to drag it, pinch to zoom.</Text>}
           {!adding && sourceCount > 0 && (
-            <TextInput style={styles.findInput} value={query} onChangeText={v => { setQuery(v); if (v.trim()) setAtHere(false); }} placeholder="Find in this list"
+            <TextInput style={styles.findInput} value={query} onChangeText={v => { setQuery(v); showAll(); }} placeholder="Find in this list"
               placeholderTextColor={theme.mutedText} autoCorrect={false} />
           )}
 
           {source === 1 && library.length === 0 && (
-            <Text style={styles.itemStats}>Nothing saved yet. A POI you add or import here is kept in the library, and so is one you save from a watch.</Text>
+            <Text style={styles.itemStats}>Nothing saved yet. Add a POI or save one from a watch.</Text>
           )}
           {source === 0 && watchHere && onWatchLoading && <Text style={styles.itemStats}>{t.poiOnWatchReading}</Text>}
           {source === 0 && watchHere && !onWatchLoading && onWatchError && (

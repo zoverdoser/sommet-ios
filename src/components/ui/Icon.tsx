@@ -11,7 +11,7 @@ export type IconName =
   | 'watch' | 'etrex' | 'bryton' | 'magene' | 'edge' | 'sun' | 'moon' | 'auto' | 'chevronLeft' | 'chevronRight'
   | 'cycling' | 'running' | 'walking'
   | 'play' | 'pause' | 'skipBack' | 'skipForward'
-  | 'download' | 'upload' | 'calendar' | 'bluetooth'
+  | 'download' | 'upload' | 'calendar' | 'bluetooth' | 'routeAddStop'
   // Nav-rail icons for the screens ported from desktop (2026-08-26). Each mirrors the Material
   // Symbol the desktop's Icons.qml picks for the same page, so the two rails read alike:
   // coach = forum, weight = monitor_weight, health = monitor_heart, ember = local_fire_department.
@@ -57,6 +57,15 @@ export default function Icon({ name, size = 20, color = '#000' }: Props) {
           <Circle cx={5} cy={19} r={2} stroke={color} strokeWidth={1.9} fill="none" />
           <Circle cx={19} cy={5} r={2} stroke={color} strokeWidth={1.9} fill="none" />
           <Path d="M6.5 17.5C9 13 6 10 9 7c2-2 5 1 8-2" {...s} />
+        </Svg>
+      );
+    case 'routeAddStop':
+      // UIX Icons Regular by MD Rakib Shekh: https://github.com/mdrakibshekh/uix-icons/blob/main/LICENSE
+      return (
+        <Svg width={size} height={size} viewBox="0 0 24 24">
+          <Path d="M2.5 18.5a2.5 2.5 0 1 0 5 0a2.5 2.5 0 1 0-5 0" {...s} strokeWidth={1.5} />
+          <Path d="M5 16v-6a3 3 0 0 1 3-3h7.5m0 0a2.5 2.5 0 1 0 5 0a2.5 2.5 0 1 0-5 0m2.5 8v6m-3-3h6"
+            {...s} strokeWidth={1.5} />
         </Svg>
       );
     case 'poi':

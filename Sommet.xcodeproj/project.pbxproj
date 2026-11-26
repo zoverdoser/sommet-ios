@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		6F870F455A6540169B761DE9 /* DeviceLocation.m in Sources */ = {isa = PBXBuildFile; fileRef = 9101BBA537264D9D8CBCF24D /* DeviceLocation.m */; };
 		4DB384642751439B9AF66339 /* MaterialSymbolsRounded.ttf in Resources */ = {isa = PBXBuildFile; fileRef = 5351B4AA1F044BB8894BFD1A /* MaterialSymbolsRounded.ttf */; };
 		0C80B921A6F3F58F76C31292 /* libPods-Sommet.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 5DCACB8F33CDC322A6C60F78 /* libPods-Sommet.a */; };
 		13B07FBF1A68108700A75B9A /* Images.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 13B07FB51A68108700A75B9A /* Images.xcassets */; };
@@ -41,6 +42,7 @@
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
+		9101BBA537264D9D8CBCF24D /* DeviceLocation.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; name = DeviceLocation.m; path = Sommet/DeviceLocation.m; sourceTree = "<group>"; };
 		5351B4AA1F044BB8894BFD1A /* MaterialSymbolsRounded.ttf */ = {isa = PBXFileReference; lastKnownFileType = file; name = MaterialSymbolsRounded.ttf; path = Sommet/MaterialSymbolsRounded.ttf; sourceTree = "<group>"; };
 		03514CCD40EF6BE35F7A5CEA /* device_driver_ambit.c */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.c.c; name = device_driver_ambit.c; path = native/libambit/device_driver_ambit.c; sourceTree = "<group>"; };
 		13B07F961A680F5B00A75B9A /* Sommet.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Sommet.app; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -98,6 +100,7 @@
 				5351B4AA1F044BB8894BFD1A /* MaterialSymbolsRounded.ttf */,
 				13B07FB51A68108700A75B9A /* Images.xcassets */,
 				761780EC2CA45674006654EE /* AppDelegate.swift */,
+				9101BBA537264D9D8CBCF24D /* DeviceLocation.m */,
 				13B07FB61A68108700A75B9A /* Info.plist */,
 				81AB9BB72411601600AC10FF /* LaunchScreen.storyboard */,
 				13B07FB81A68108700A75B9A /* PrivacyInfo.xcprivacy */,
@@ -348,6 +351,7 @@
 				ECF13A97D3292950B1ECF8D8 /* AmbitBleModule.m in Sources */,
 				E0696F9801380EE3648B8925 /* AmbitUsbModule.mm in Sources */,
 				6B24F548122B9D22933D5412 /* GarminModule.mm in Sources */,
+				6F870F455A6540169B761DE9 /* DeviceLocation.m in Sources */,
 				AE2A5283E4934893485AD0CF /* crc16.c in Sources */,
 				43D479BCEECF90AAFE05C10C /* debug.c in Sources */,
 				8F8C957665896FF610220CB9 /* device_driver_ambit.c in Sources */,

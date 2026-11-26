@@ -23,13 +23,14 @@ export default function RoutesAndPoisScreen() {
   const isRoutes = section === 0;
 
   useLayoutEffect(() => {
+    if (!isRoutes) return;
     navigation.setOptions({
-      headerRight: isRoutes ? () => (
+      headerRight: () => (
         <Pressable accessibilityRole="button" accessibilityLabel={t.routeImportTitle} style={styles.headerButton}
           onPress={() => navigation.navigate('RouteImport')}>
-          <Icon name="download" size={22} color={theme.text} />
+          <Icon name="routeAddStop" size={26} color={theme.text} />
         </Pressable>
-      ) : undefined,
+      ),
     });
   }, [isRoutes, navigation, theme.text]);
 
@@ -52,7 +53,7 @@ export default function RoutesAndPoisScreen() {
       </View>
       {PoiScreen && (
         <View style={[styles.root, isRoutes && styles.hidden]}>
-          <PoiScreen watch={watch.watch} active={!isRoutes} />
+          <PoiScreen watch={watch.watch} active={!isRoutes} embedded />
         </View>
       )}
     </View>
